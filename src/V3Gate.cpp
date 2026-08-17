@@ -615,8 +615,9 @@ class GateInline final {
         if (pair.second) pair.first->second = substp->cloneTreePure(false);
     }
 
-    void commitSubstitutions(AstNode* logicp) {
-        if (!m_hasPending.erase(logicp)) return;  // Had no pending substitutions
+    // Returns true iff it committed (which also constifies 'logicp' via constifyEdit below)
+    bool commitSubstitutions(AstNode* logicp) {
+        if (!m_hasPending.erase(logicp)) return false;  // Had no pending substitutions
 
         Substitutions& substitutions = m_substitutions(logicp);
         UASSERT_OBJ(!substitutions.empty(), logicp, "No pending substitutions");
@@ -666,6 +667,7 @@ class GateInline final {
         UASSERT_OBJ(simplifiedp == logicp, simplifiedp, "Should not remove whole logic");
         for (const auto& pair : substitutions) pair.second->deleteTree();
         substitutions.clear();
+        return true;
     }
 
     void optimizeSignals(bool allowMultiIn) {
@@ -694,7 +696,7 @@ class GateInline final {
             AstNode* const logicp = lVtxp->nodep();
 
             // Commit pending optimizations to driving logic, as we will re-analyze
-            commitSubstitutions(logicp);
+            const bool committed = commitSubstitutions(logicp);
 
             // Can we eliminate?
             const GateOkVisitor okVisitor{logicp, false, false};
@@ -704,8 +706,9 @@ class GateInline final {
             // If the varScope is already removed from logicp, no need to try substitution.
             if (!okVisitor.varAssigned(vVtxp->varScp())) continue;
 
-            // Expression we are considering to substitute with
-            AstNodeExpr* const substp = V3Const::constifyEdit(okVisitor.substitutionp());
+            // A commit above already constified logicp (rhs included), so re-constify is redundant
+            AstNodeExpr* const substp = committed ? okVisitor.substitutionp()
+                                                  : V3Const::constifyEdit(okVisitor.substitutionp());
             // Number of variables read by the substitution
             const size_t nReads = okVisitor.readVscps().size();
 
