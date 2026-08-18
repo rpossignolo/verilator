@@ -125,6 +125,26 @@ private:
 
     int endLevels(const char* strg);
     void putcNoTracking(char chr);
+    // Update column/line state for one output char, without emitting it.
+    // Lets putns emit verbatim runs in bulk while keeping exact break state.
+    void trackChar(char chr) {
+        switch (chr) {
+        case '\n':
+            ++m_lineno;
+            m_column = 0;
+            m_nobreak = true;
+            break;
+        case '\t': m_column = ((m_column + 9) / 8) * 8; break;
+        case ' ':
+        case '(':
+        case '|':
+        case '&': ++m_column; break;
+        default:
+            ++m_column;
+            m_nobreak = false;
+            break;
+        }
+    }
 
 public:
     explicit V3OutFormatter(Language lang);
@@ -178,6 +198,10 @@ public:
     // CALLBACKS - MUST OVERRIDE
     virtual void putcOutput(char chr) = 0;
     virtual void putsOutput(const char* str) = 0;
+    // Emit exactly len bytes (may contain embedded NULs); override for bulk write
+    virtual void putsOutput(const char* str, std::size_t len) {
+        for (std::size_t i = 0; i < len; ++i) putcOutput(str[i]);
+    }
 };
 
 //============================================================================
@@ -229,8 +253,8 @@ private:
         m_bufferp->at(m_usedBytes++) = chr;
         if (VL_UNLIKELY(m_usedBytes >= WRITE_BUFFER_SIZE_BYTES)) writeBlock();
     }
-    void putsOutput(const char* str) override {
-        std::size_t len = strlen(str);
+    void putsOutput(const char* str) override { putsOutput(str, strlen(str)); }
+    void putsOutput(const char* str, std::size_t len) override {
         std::size_t availableBytes = WRITE_BUFFER_SIZE_BYTES - m_usedBytes;
         while (VL_UNLIKELY(len >= availableBytes)) {
             std::memcpy(m_bufferp->data() + m_usedBytes, str, availableBytes);
@@ -431,6 +455,7 @@ public:
 
     void putcOutput(char chr) override { m_ostream << chr; };
     void putsOutput(const char* str) override { m_ostream << str; };
+    void putsOutput(const char* str, std::size_t len) override { m_ostream.write(str, len); };
 };
 
 //============================================================================

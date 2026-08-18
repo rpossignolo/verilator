@@ -761,8 +761,13 @@ void V3OutFormatter::putns(const AstNode* nodep, const char* strg) {
     bool notstart = false;
     bool wordstart = true;
     bool equalsForBracket = false;  // Looking for "= {"
-    for (const char* cp = strg; *cp; ++cp) {
-        putcNoTracking(*cp);
+    // Emit the payload verbatim in bulk runs; only track break state per char.
+    // strg is a C string (no embedded NULs) and output equals strg with indent
+    // injected after internal newlines, so runs flush byte-identically.
+    const char* runp = strg;
+    const char* cp = strg;
+    for (; *cp; ++cp) {
+        trackChar(*cp);
         if (std::isalpha(*cp)) {
             if (wordstart && m_lang == LA_VERILOG && tokenNotStart(cp)) notstart = true;
             if (wordstart && m_lang == LA_VERILOG && !notstart && tokenStart(cp)) indentInc();
@@ -778,6 +783,8 @@ void V3OutFormatter::putns(const AstNode* nodep, const char* strg) {
                 m_prependIndent = true;
             } else {
                 m_prependIndent = false;
+                putsOutput(runp, static_cast<size_t>(cp + 1 - runp));
+                runp = cp + 1;
                 putsNoTracking(indentSpaces(endLevels(cp + 1)));
             }
             break;
@@ -792,8 +799,8 @@ void V3OutFormatter::putns(const AstNode* nodep, const char* strg) {
                 if (cp > strg && cp[-1] == '/' && !m_inStringLiteral) {
                     // Output ignoring contents to EOL
                     ++cp;
-                    while (*cp && cp[1] && cp[1] != '\n') putcNoTracking(*cp++);
-                    if (*cp) putcNoTracking(*cp);
+                    while (*cp && cp[1] && cp[1] != '\n') trackChar(*cp++);
+                    if (*cp) trackChar(*cp);
                 }
             }
             break;
@@ -857,6 +864,7 @@ void V3OutFormatter::putns(const AstNode* nodep, const char* strg) {
         default: equalsForBracket = false; break;
         }
     }
+    if (cp > runp) putsOutput(runp, static_cast<size_t>(cp - runp));
 }
 
 void V3OutFormatter::putBreakExpr() {
@@ -890,7 +898,9 @@ void V3OutFormatter::putsNoTracking(const string& strg) {
         return;
     }
     // Don't track {}'s, probably because it's a $display format string
-    for (const char c : strg) putcNoTracking(c);
+    // Emit in bulk (identical bytes), then update break state per char.
+    putsOutput(strg.data(), strg.size());
+    for (const char c : strg) trackChar(c);
 }
 
 void V3OutFormatter::putcNoTracking(char chr) {
@@ -898,22 +908,7 @@ void V3OutFormatter::putcNoTracking(char chr) {
         putcOutput(chr);
         return;
     }
-    switch (chr) {
-    case '\n':
-        ++m_lineno;
-        m_column = 0;
-        m_nobreak = true;
-        break;
-    case '\t': m_column = ((m_column + 9) / 8) * 8; break;
-    case ' ':
-    case '(':
-    case '|':
-    case '&': ++m_column; break;
-    default:
-        ++m_column;
-        m_nobreak = false;
-        break;
-    }
+    trackChar(chr);
     putcOutput(chr);
 }
 
