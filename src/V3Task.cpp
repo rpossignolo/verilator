@@ -1768,7 +1768,9 @@ class TaskVisitor final : public VNVisitor {
             // or interface-local member access, which is not truly external).
             // Will likely not schedule correctly.
             // TODO: Why not if recursive? It will not work ...
-            if (noInline && !nodep->classMethod() && !nodep->recursive()) {
+            // DPI exports mark their non-local accesses (writtenByDpi + export trigger) below,
+            // so external references from an exported body are already ordered correctly.
+            if (noInline && !nodep->classMethod() && !nodep->recursive() && !nodep->dpiExport()) {
                 if (AstNode* const impurep = m_statep->checkImpure(nodep)) {
                     if (!isIfaceLocalImpure(nodep, impurep)) {
                         nodep->v3warn(IMPURE, "Unsupported: External variable referenced by "
