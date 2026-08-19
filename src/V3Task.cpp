@@ -193,6 +193,19 @@ private:
         }
     }
 
+    // A DPI-exported subroutine already emits a standalone implementation CFunc and sits on the
+    // cold C boundary, so inlining a big body at each internal call site only bloats code.
+    static bool dpiExportKeepShared(const AstNodeFTask* ftaskp) {
+        if (!ftaskp->dpiExport()) return false;
+        if (ftaskp->classMethod() || ftaskp->recursive() || ftaskp->isConstructor()) return false;
+        if (ftaskp->taskPublic()) return false;
+        // Only substantial bodies; trivial exports stay inlined to avoid needless churn.
+        constexpr int minBodyNodes = 40;
+        const int nodes = ftaskp->nodeCount();
+        UINFO(6, "  dpiExport body nodes=" << nodes << " " << ftaskp->prettyNameQ());
+        return nodes > minBodyNodes;
+    }
+
     void decideInlining() {
         for (V3GraphVertex& vtx : m_callGraph.vertices()) {
             TaskFTaskVertex* const ftVtxp = vtx.cast<TaskFTaskVertex>();
@@ -206,10 +219,15 @@ private:
                 continue;
             }
 
+            AstNodeFTask* const ftaskp = ftVtxp->nodep();
+            // Applies even under eager inlining: reuse the shared export CFunc for big cold bodies.
+            if (dpiExportKeepShared(ftaskp)) {
+                ftVtxp->noInline(true);
+                continue;
+            }
+
             // If eagerly inlining (historic - and still default - behaviour) then nothing to do
             if (v3Global.opt.fInlineFuncsEager()) continue;
-
-            AstNodeFTask* const ftaskp = ftVtxp->nodep();
             // We are relying on inlining of some internal functions for
             // functional corretness. Probably that's not a good thing?
             if (!ftaskp->verilogFunction()) continue;
