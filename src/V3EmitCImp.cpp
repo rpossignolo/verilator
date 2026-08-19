@@ -39,8 +39,9 @@ class EmitCImp final : public EmitCFunc {
     const std::string m_fileBaseName = EmitCUtil::prefixNameProtect(m_fileModp);
 
     // METHODS
-    void openNextOutputFile(const std::string& fileName) {
-        openNewOutputSourceFile(fileName, m_slow, false, "Design implementation internals");
+    void openNextOutputFile(const std::string& fileName) { openNextOutputFile(fileName, m_slow); }
+    void openNextOutputFile(const std::string& fileName, bool slow) {
+        openNewOutputSourceFile(fileName, slow, false, "Design implementation internals");
         puts("// See " + EmitCUtil::topClassName() + ".h for the primary calling header\n");
         puts("\n");
         puts("#include \"" + EmitCUtil::pchClassName() + ".h\"\n");
@@ -434,16 +435,34 @@ class EmitCImp final : public EmitCFunc {
         // Do not create empty files
         if (funcps.empty()) return;
 
-        // Open output file
-        openNextOutputFile(m_uniqueNames.get(m_fileBaseName));
-        // Emit all functions
+        // A pathologically large function can ICE the host compiler at -O; give each its own
+        // OPT_SLOW=-O0 TU so the rest stays -Os. Threshold well above any normally-split function.
+        constexpr int optNoneNodeThreshold = 100000;
+        std::vector<AstCFunc*> normalps;
+        std::vector<AstCFunc*> hugeps;
         for (AstCFunc* const funcp : funcps) {
+            (funcp->nodeCount() > optNoneNodeThreshold ? hugeps : normalps).push_back(funcp);
+        }
+
+        const auto emitInto = [this](AstCFunc* const funcp) {
             VL_RESTORER(m_modp);
             m_modp = EmitCParentModule::get(funcp);
             iterateConst(funcp);
+        };
+
+        if (!normalps.empty()) {
+            openNextOutputFile(m_uniqueNames.get(m_fileBaseName));
+            for (AstCFunc* const funcp : normalps) emitInto(funcp);
+            closeOutputFile();
         }
-        // Close output file
-        closeOutputFile();
+        // Force separate compilation and a dedicated -O0 TU: a non-parallel build would fold this
+        // into __ALL.cpp at OPT_FAST, and per-function optimize() can't reach the coroutine actor.
+        if (!hugeps.empty()) v3Global.useParallelBuild(true);
+        for (AstCFunc* const funcp : hugeps) {
+            openNextOutputFile(m_uniqueNames.get(m_fileBaseName), /* slow: */ true);
+            emitInto(funcp);
+            closeOutputFile();
+        }
     }
 
     // VISITORS
