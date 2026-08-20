@@ -695,6 +695,12 @@ class GateInline final {
             if (!lVtxp->reducible()) continue;
             AstNode* const logicp = lVtxp->nodep();
 
+            // Buffers-only pass can never inline a >1-input driver (shouldInline rejects nReads>1);
+            // skip its re-analysis unless a pending commit could collapse the already-constified rhs.
+            if (!allowMultiIn && !lVtxp->inEmpty() && !lVtxp->inSize1()
+                && !m_hasPending.count(logicp))
+                continue;
+
             // Commit pending optimizations to driving logic, as we will re-analyze
             const bool committed = commitSubstitutions(logicp);
 
