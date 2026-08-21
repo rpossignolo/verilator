@@ -1617,6 +1617,10 @@ public:
 void V3LinkParse::linkParse(AstNetlist* rootp) {
     UINFO(4, __FUNCTION__ << ": ");
     { LinkParseVisitor{rootp}; }  // Destruct before checking
-    if (v3Global.opt.hierChild()) HierIfaceFlattenVisitor{rootp};
+    if (v3Global.opt.hierChild()) {
+        HierIfaceFlattenVisitor{rootp};
+        // Abort now on an unsupported boundary so LinkDot doesn't fault on the leftover port
+        V3Error::abortIfErrors();
+    }
     V3Global::dumpCheckGlobalTree("linkparse", 0, dumpTreeEitherLevel() >= 6);
 }
