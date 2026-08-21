@@ -25,7 +25,10 @@
 #include "V3Control.h"
 #include "V3Stats.h"
 
+#include <algorithm>
+#include <map>
 #include <set>
+#include <utility>
 #include <vector>
 
 VL_DEFINE_DEBUG_FUNCTIONS;
@@ -1423,10 +1426,133 @@ public:
 };
 
 //######################################################################
+// Hier-block interface-port flattening (child side)
+// Interface types can't cross the hier_block separate-compile ABI, so the child (which
+// verilates the block as top) splits each boundary iface/modport port into plain member
+// ports; the parent reconnects the matching pins in V3LinkCells with the same names.
+
+class HierIfaceFlattenVisitor final : public VNVisitor {
+    // Child verilation (block as top) splits the block's own iface/modport ports into
+    // plain member ports; the parent side is reconnected in V3LinkCells.
+    AstNodeModule* m_flatModp = nullptr;  // Block module currently being flattened
+    int m_nextPin = 0;  // Next unique pin number for generated member ports
+    // Flattened port name -> ordered member (memberName, direction) pairs
+    std::map<std::string, std::vector<std::pair<std::string, VDirection>>> m_portMembers;
+
+    // Single-underscore tag: '__' would trip Verilator's reserved-name encoding and
+    // mangle the child<->parent round-trip through the generated wrapper .sv.
+    static std::string sep() { return "_ifm_"; }
+    static std::string memberName(const std::string& port, const std::string& member) {
+        return port + sep() + member;
+    }
+    static AstModport* findModport(AstIface* ifacep, const std::string& name) {
+        for (AstNode* np = ifacep->stmtsp(); np; np = np->nextp())
+            if (AstModport* const mp = VN_CAST(np, Modport))
+                if (mp->name() == name) return mp;
+        return nullptr;
+    }
+    static AstVar* findMemberVar(AstIface* ifacep, const std::string& name) {
+        for (AstNode* np = ifacep->stmtsp(); np; np = np->nextp())
+            if (AstVar* const vp = VN_CAST(np, Var))
+                if (vp->name() == name) return vp;
+        return nullptr;
+    }
+    // Split each iface/modport port of the block into plain member ports
+    void flattenBlockPorts(AstNodeModule* modp) {
+        // Only actual boundary ports (an AstPort exists); skip interface-instance vars
+        std::set<std::string> portNames;
+        for (AstNode* np = modp->stmtsp(); np; np = np->nextp())
+            if (const AstPort* const pp = VN_CAST(np, Port)) {
+                portNames.insert(pp->name());
+                m_nextPin = std::max(m_nextPin, pp->pinNum());
+            }
+        std::vector<AstVar*> ports;
+        for (AstNode* np = modp->stmtsp(); np; np = np->nextp())
+            if (AstVar* const vp = VN_CAST(np, Var))
+                if (!vp->isIfaceParent() && VN_IS(vp->childDTypep(), IfaceRefDType)
+                    && portNames.count(vp->name()))
+                    ports.push_back(vp);
+        if (ports.empty()) return;
+        m_flatModp = modp;
+        for (AstVar* const portp : ports) {
+            const AstIfaceRefDType* const idt = VN_AS(portp->childDTypep(), IfaceRefDType);
+            AstIface* const ifacep = idt->ifacep();
+            AstModport* const mpp = (ifacep && !idt->modportName().empty())
+                                        ? findModport(ifacep, idt->modportName())
+                                        : nullptr;
+            if (!mpp) {
+                portp->v3warn(E_UNSUPPORTED, "Unsupported: hier_block interface port without a "
+                                             "modport: "
+                                                 << portp->prettyNameQ());
+                continue;
+            }
+            auto& members = m_portMembers[portp->name()];
+            for (AstNode* mnp = mpp->varsp(); mnp; mnp = mnp->nextp()) {
+                const AstModportVarRef* const mvr = VN_CAST(mnp, ModportVarRef);
+                if (!mvr) continue;
+                AstVar* const memVarp = findMemberVar(ifacep, mvr->name());
+                UASSERT_OBJ(memVarp && memVarp->childDTypep(), mvr,
+                            "Modport member not found in interface");
+                AstVar* const newp
+                    = new AstVar{portp->fileline(), VVarType::PORT,
+                                 memberName(portp->name(), mvr->name()), VFlagChildDType{},
+                                 memVarp->childDTypep()->cloneTree(false)};
+                newp->direction(mvr->direction());
+                newp->declDirection(mvr->direction());
+                portp->addNextHere(newp);
+                members.emplace_back(newp->name(), mvr->direction());
+            }
+            VL_DO_DANGLING(portp->unlinkFrBack()->deleteTree(), portp);
+        }
+        iterateChildren(modp);  // Rewrite AstPort list and member accesses
+        m_flatModp = nullptr;
+        m_nextPin = 0;
+        m_portMembers.clear();
+    }
+
+    // VISITORS
+    void visit(AstNodeModule* nodep) override {
+        if (!m_flatModp && nodep->name() == v3Global.opt.topModule()) {
+            flattenBlockPorts(nodep);
+            return;
+        }
+        iterateChildren(nodep);
+    }
+    void visit(AstPort* nodep) override {
+        if (!m_flatModp) return;
+        const auto it = m_portMembers.find(nodep->name());
+        if (it == m_portMembers.end()) return;
+        for (const auto& mem : it->second)
+            nodep->addNextHere(new AstPort{nodep->fileline(), ++m_nextPin, mem.first});
+        VL_DO_DANGLING(nodep->unlinkFrBack()->deleteTree(), nodep);
+    }
+    void visit(AstDot* nodep) override {
+        if (m_flatModp) {
+            const AstParseRef* const lhsp = VN_CAST(nodep->lhsp(), ParseRef);
+            const AstParseRef* const rhsp = VN_CAST(nodep->rhsp(), ParseRef);
+            if (lhsp && rhsp && !nodep->colon() && !lhsp->lhsp()
+                && m_portMembers.count(lhsp->name())) {
+                AstParseRef* const newp = new AstParseRef{
+                    nodep->fileline(), memberName(lhsp->name(), rhsp->name())};
+                nodep->replaceWith(newp);
+                VL_DO_DANGLING(nodep->deleteTree(), nodep);
+                return;
+            }
+        }
+        iterateChildren(nodep);
+    }
+    void visit(AstNode* nodep) override { iterateChildren(nodep); }
+
+public:
+    explicit HierIfaceFlattenVisitor(AstNetlist* rootp) { iterate(rootp); }
+};
+
+//######################################################################
 // Link class functions
 
 void V3LinkParse::linkParse(AstNetlist* rootp) {
     UINFO(4, __FUNCTION__ << ": ");
     { LinkParseVisitor{rootp}; }  // Destruct before checking
+    if (v3Global.opt.hierChild()) HierIfaceFlattenVisitor{rootp};
     V3Global::dumpCheckGlobalTree("linkparse", 0, dumpTreeEitherLevel() >= 6);
 }

@@ -354,9 +354,10 @@ class HierBlockUsageCollectVisitor final : public VNVisitorConst {
     void visit(AstVar* nodep) override {
         if (!m_modp) return;
         if (!m_modp->hierBlock()) return;
-        // Can't handle interface port on hier block
+        // Boundary interface ports are flattened to member signals in the child/parent
+        // verilation (V3LinkParse), so the block plan need not reject them here.
         if (nodep->isIfaceRef() && !nodep->isIfaceParent()) {
-            nodep->v3error("Modport cannot be used at the hierarchical block boundary");
+            UINFO(4, "hier-iface boundary port (flattened downstream): " << nodep->prettyNameQ());
         }
         // Record overridden value parameter of this hier block
         if (nodep->isGParam() && nodep->overriddenParam()) {
