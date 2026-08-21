@@ -31,7 +31,9 @@
 #include "V3Parse.h"
 #include "V3SymTable.h"
 
+#include <cctype>
 #include <map>
+#include <string>
 #include <unordered_set>
 #include <vector>
 
@@ -581,33 +583,57 @@ class LinkCellsVisitor final : public VNVisitor {
 
     // A hier_block boundary interface port was flattened to plain member ports in the
     // block wrapper (see V3LinkParse); reconnect the parent's iface pin to those members.
+    // Names are '<pin>_ifm_<member>' (scalar) or '<pin>_ifm<elem>_<member>' (iface array).
+    struct HierMember {
+        std::string portName;  // Full member-port name on the wrapper
+        std::string member;  // Interface member name
+        bool isArray = false;
+        int elem = 0;  // Array element index
+    };
     static void expandHierIfacePins(AstCell* nodep) {
-        static const std::string sep = "_ifm_";
         AstNodeModule* const modp = nodep->modp();
-        std::map<std::string, std::vector<std::string>> portMembers;
+        std::map<std::string, std::vector<HierMember>> byPin;
         std::unordered_set<std::string> plainPorts;
         for (AstNode* np = modp->stmtsp(); np; np = np->nextp()) {
             const AstPort* const pp = VN_CAST(np, Port);
             if (!pp) continue;
             plainPorts.insert(pp->name());
-            const size_t pos = pp->name().find(sep);
-            if (pos != std::string::npos)
-                portMembers[pp->name().substr(0, pos)].push_back(pp->name().substr(pos + sep.size()));
+            const size_t pos = pp->name().find("_ifm");
+            if (pos == std::string::npos) continue;
+            const std::string pin = pp->name().substr(0, pos);
+            const std::string rest = pp->name().substr(pos + 4);  // after "_ifm"
+            HierMember m;
+            m.portName = pp->name();
+            if (!rest.empty() && rest[0] == '_') {
+                m.member = rest.substr(1);
+            } else {
+                size_t i = 0;
+                while (i < rest.size() && std::isdigit(static_cast<unsigned char>(rest[i]))) ++i;
+                if (i == 0 || i >= rest.size() || rest[i] != '_') continue;
+                m.isArray = true;
+                m.elem = std::stoi(rest.substr(0, i));
+                m.member = rest.substr(i + 1);
+            }
+            byPin[pin].push_back(m);
         }
-        if (portMembers.empty()) return;
+        if (byPin.empty()) return;
         for (AstPin *nextp, *pinp = nodep->pinsp(); pinp; pinp = nextp) {
             nextp = VN_CAST(pinp->nextp(), Pin);
             if (pinp->param() || !pinp->exprp() || plainPorts.count(pinp->name())) continue;
-            const auto it = portMembers.find(pinp->name());
-            if (it == portMembers.end()) continue;
+            const auto it = byPin.find(pinp->name());
+            if (it == byPin.end()) continue;
             AstNodeExpr* const connp = VN_CAST(pinp->exprp(), NodeExpr);
             if (!connp) continue;
             int pn = pinp->pinNum();
-            for (const std::string& member : it->second) {
-                AstNodeExpr* const memp = new AstDot{pinp->fileline(), false, connp->cloneTree(false),
-                                                     new AstParseRef{pinp->fileline(), member}};
-                pinp->addNextHere(new AstPin{pinp->fileline(), pn++,
-                                             pinp->name() + sep + member, memp});
+            for (const HierMember& m : it->second) {
+                AstNodeExpr* basep = connp->cloneTree(false);
+                if (m.isArray)
+                    basep = new AstSelBit{pinp->fileline(), basep,
+                                          new AstConst{pinp->fileline(),
+                                                       static_cast<uint32_t>(m.elem)}};
+                AstNodeExpr* const memp = new AstDot{pinp->fileline(), false, basep,
+                                                     new AstParseRef{pinp->fileline(), m.member}};
+                pinp->addNextHere(new AstPin{pinp->fileline(), pn++, m.portName, memp});
             }
             VL_DO_DANGLING(pinp->unlinkFrBack()->deleteTree(), pinp);
         }
