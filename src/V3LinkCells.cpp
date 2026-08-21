@@ -31,6 +31,7 @@
 #include "V3Parse.h"
 #include "V3SymTable.h"
 
+#include <map>
 #include <unordered_set>
 #include <vector>
 
@@ -578,6 +579,40 @@ class LinkCellsVisitor final : public VNVisitor {
         VL_DO_DANGLING(pushDeletep(nodep->unlinkFrBack()), nodep);
     }
 
+    // A hier_block boundary interface port was flattened to plain member ports in the
+    // block wrapper (see V3LinkParse); reconnect the parent's iface pin to those members.
+    static void expandHierIfacePins(AstCell* nodep) {
+        static const std::string sep = "_ifm_";
+        AstNodeModule* const modp = nodep->modp();
+        std::map<std::string, std::vector<std::string>> portMembers;
+        std::unordered_set<std::string> plainPorts;
+        for (AstNode* np = modp->stmtsp(); np; np = np->nextp()) {
+            const AstPort* const pp = VN_CAST(np, Port);
+            if (!pp) continue;
+            plainPorts.insert(pp->name());
+            const size_t pos = pp->name().find(sep);
+            if (pos != std::string::npos)
+                portMembers[pp->name().substr(0, pos)].push_back(pp->name().substr(pos + sep.size()));
+        }
+        if (portMembers.empty()) return;
+        for (AstPin *nextp, *pinp = nodep->pinsp(); pinp; pinp = nextp) {
+            nextp = VN_CAST(pinp->nextp(), Pin);
+            if (pinp->param() || !pinp->exprp() || plainPorts.count(pinp->name())) continue;
+            const auto it = portMembers.find(pinp->name());
+            if (it == portMembers.end()) continue;
+            AstNodeExpr* const connp = VN_CAST(pinp->exprp(), NodeExpr);
+            if (!connp) continue;
+            int pn = pinp->pinNum();
+            for (const std::string& member : it->second) {
+                AstNodeExpr* const memp = new AstDot{pinp->fileline(), false, connp->cloneTree(false),
+                                                     new AstParseRef{pinp->fileline(), member}};
+                pinp->addNextHere(new AstPin{pinp->fileline(), pn++,
+                                             pinp->name() + sep + member, memp});
+            }
+            VL_DO_DANGLING(pinp->unlinkFrBack()->deleteTree(), pinp);
+        }
+    }
+
     void visit(AstCell* nodep) override {
         // Cell: Resolve its filename.  If necessary, parse it.
         // Execute only once.  Complication is that cloning may result in
@@ -675,6 +710,7 @@ class LinkCellsVisitor final : public VNVisitor {
         }
         if (nodep->modp()) {
             nodep->modName(nodep->modp()->name());
+            expandHierIfacePins(nodep);
             // Note what pins exist
             std::unordered_set<string> ports;  // Symbol table of all connected port names
             for (AstPin* pinp = nodep->pinsp(); pinp; pinp = VN_AS(pinp->nextp(), Pin)) {
