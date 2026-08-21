@@ -42,6 +42,8 @@ constexpr uint32_t GATE_DEDUP_MAX_DEPTH = 20;
 //######################################################################
 // Gate graph classes
 
+class GateEdge;  // For build-time per-block edge coalescing cache on GateVarVertex
+
 class GateEitherVertex VL_NOT_FINAL : public V3GraphVertex {
     VL_RTTI_IMPL(GateEitherVertex, V3GraphVertex)
     bool m_reducible = true;  // True if this node should be able to be eliminated
@@ -87,7 +89,25 @@ class GateVarVertex final : public GateEitherVertex {
     bool m_isClock = false;
     AstNode* m_rstSyncNodep = nullptr;  // Used as reset and not in SenItem, in clocked always
     AstNode* m_rstAsyncNodep = nullptr;  // Used as reset and in SenItem, in clocked always
+    // Build-time edge coalescing: cache the current logic block's edge so repeat refs
+    // bump its weight instead of allocating a duplicate (merged anyway later).
+    const void* m_rdCacheLogicp = nullptr;
+    GateEdge* m_rdCacheEdgep = nullptr;
+    const void* m_wrCacheLogicp = nullptr;
+    GateEdge* m_wrCacheEdgep = nullptr;
 public:
+    const void* rdCacheLogicp() const { return m_rdCacheLogicp; }
+    GateEdge* rdCacheEdgep() const { return m_rdCacheEdgep; }
+    void rdCache(const void* logicp, GateEdge* edgep) {
+        m_rdCacheLogicp = logicp;
+        m_rdCacheEdgep = edgep;
+    }
+    const void* wrCacheLogicp() const { return m_wrCacheLogicp; }
+    GateEdge* wrCacheEdgep() const { return m_wrCacheEdgep; }
+    void wrCache(const void* logicp, GateEdge* edgep) {
+        m_wrCacheLogicp = logicp;
+        m_wrCacheEdgep = edgep;
+    }
     GateVarVertex(V3Graph* graphp, AstVarScope* varScp)
         : GateEitherVertex{graphp}
         , m_varScp{varScp} {}
@@ -179,12 +199,12 @@ public:
         return vVtxp;
     }
 
-    void addEdge(GateVarVertex* srcp, GateLogicVertex* dstp, int weight) {
-        new GateEdge{this, srcp, dstp, weight};
+    GateEdge* addEdge(GateVarVertex* srcp, GateLogicVertex* dstp, int weight) {
+        return new GateEdge{this, srcp, dstp, weight};
     }
 
-    void addEdge(GateLogicVertex* srcp, GateVarVertex* dstp, int weight) {
-        new GateEdge{this, srcp, dstp, weight};
+    GateEdge* addEdge(GateLogicVertex* srcp, GateVarVertex* dstp, int weight) {
+        return new GateEdge{this, srcp, dstp, weight};
     }
 };
 
@@ -202,6 +222,7 @@ class GateBuildVisitor final : public VNVisitorConst {
     bool m_inEdgeActive = false;  // Underneath edge active
     bool m_inStaticActive = false;  // Underneath static active
     bool m_inSenItem = false;  // Underneath AstSenItem; any varrefs are clocks
+    size_t m_statCoalesced = 0;  // Duplicate same-block edges folded by weight bump
 
     // METHODS
     void checkNode(AstNode* nodep) {
@@ -298,10 +319,26 @@ class GateBuildVisitor final : public VNVisitorConst {
             }
         }
 
-        // We use weight of one; if we ref the var more than once, when we simplify,
-        // the weight will increase
-        if (nodep->access().isWriteOrRW()) m_graphp->addEdge(m_logicVertexp, vVtxp, 1);
-        if (nodep->access().isReadOrRW()) m_graphp->addEdge(vVtxp, m_logicVertexp, 1);
+        // Weight of one per ref; coalesce repeat refs from this same logic block by
+        // bumping the cached edge's weight, matching the later removeRedundantEdgesSum.
+        if (nodep->access().isWriteOrRW()) {
+            if (vVtxp->wrCacheLogicp() == m_logicVertexp) {
+                GateEdge* const ep = vVtxp->wrCacheEdgep();
+                ep->weight(ep->weight() + 1);
+                ++m_statCoalesced;
+            } else {
+                vVtxp->wrCache(m_logicVertexp, m_graphp->addEdge(m_logicVertexp, vVtxp, 1));
+            }
+        }
+        if (nodep->access().isReadOrRW()) {
+            if (vVtxp->rdCacheLogicp() == m_logicVertexp) {
+                GateEdge* const ep = vVtxp->rdCacheEdgep();
+                ep->weight(ep->weight() + 1);
+                ++m_statCoalesced;
+            } else {
+                vVtxp->rdCache(m_logicVertexp, m_graphp->addEdge(vVtxp, m_logicVertexp, 1));
+            }
+        }
     }
     void visit(AstConcat* nodep) override {
         UASSERT_OBJ(!(VN_IS(nodep->backp(), NodeAssign)
@@ -317,7 +354,10 @@ class GateBuildVisitor final : public VNVisitorConst {
     }
 
     // CONSTRUCTORS
-    explicit GateBuildVisitor(AstNetlist* nodep) { iterateChildrenConst(nodep); }
+    explicit GateBuildVisitor(AstNetlist* nodep) {
+        iterateChildrenConst(nodep);
+        V3Stats::addStatSum("Optimizations, Gate build edges coalesced", m_statCoalesced);
+    }
 
 public:
     static std::unique_ptr<GateGraph> apply(AstNetlist* netlistp) {
