@@ -30,6 +30,7 @@
 
 #include <algorithm>
 #include <iterator>
+#include <unordered_set>
 
 VL_DEFINE_DEBUG_FUNCTIONS;
 
@@ -2025,7 +2026,10 @@ static void dfgSelectLogicForSynthesis(DfgGraph& dfg) {
         if (!logicp->hasMultipleSinks()) worklist.push_front(*logicp);
     }
 
-    // Now expand to cover all logic driving the same set of variables and mark
+    // Now expand to cover all logic driving the same set of variables and mark.
+    // A sink shared by N drivers was rescanned once per driver (O(N^2)); once its
+    // sources are enqueued the first time, later drivers can skip it.
+    std::unordered_set<const DfgVertex*> expandedSinks;
     worklist.foreach([&](DfgVertex& vtx) {
         DfgLogic& logic = *vtx.as<DfgLogic>();
         UASSERT_OBJ(!logic.selectedForSynthesis(), &vtx, "Should not be visited twice");
@@ -2033,6 +2037,7 @@ static void dfgSelectLogicForSynthesis(DfgGraph& dfg) {
         logic.setSelectedForSynthesis();
         // Enqueue all other logic driving the same variables as this one
         logic.foreachSink([&](DfgVertex& sink) {
+            if (!expandedSinks.insert(&sink).second) return false;
             sink.as<DfgUnresolved>()->foreachSource([&](DfgVertex& sibling) {
                 DfgLogic& siblingLogic = *sibling.as<DfgLogic>();
                 if (!siblingLogic.selectedForSynthesis()) worklist.push_front(siblingLogic);
