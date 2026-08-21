@@ -1143,6 +1143,63 @@ class TraceVisitor final : public VNVisitor {
 
         // Create the trace cleanup function clearing the activity flags
         createCleanupFunction();
+
+        if (getenv("VLT_TRACE_CSE_STATS")) analyzeCseOpportunity();
+    }
+
+    // Measure per-function common-subexpression sharing across TraceInc value
+    // expressions. Output-neutral: reads the tree, changes nothing.
+    void analyzeCseOpportunity() {
+        uint64_t nInc = 0, nFunc = 0;
+        uint64_t rootSz1 = 0, rootSz2 = 0, rootSz3to5 = 0, rootSzBig = 0;
+        uint64_t totalNodes = 0, leafNodes = 0, nonLeaf = 0, distinctNonLeaf = 0;
+        for (AstNode* blockp = m_topScopep->blocksp(); blockp; blockp = blockp->nextp()) {
+            AstCFunc* const funcp = VN_CAST(blockp, CFunc);
+            if (!funcp || !funcp->isTrace()) continue;
+            const string& nm = funcp->name();
+            if (nm.find("_chg_") == string::npos && nm.find("_full_") == string::npos) continue;
+            ++nFunc;
+            // Per-function dup detection (temps would be function-local).
+            V3Hasher hasher;
+            std::unordered_map<uint32_t, int> seen;
+            funcp->foreach([&](AstTraceInc* incp) {
+                AstNodeExpr* const rootp = incp->valuep();
+                if (!rootp) return;
+                ++nInc;
+                int sz = 0;
+                rootp->foreach([&](AstNode* np) {
+                    ++sz;
+                    ++totalNodes;
+                    const bool leaf = (np->op1p() == nullptr && np->op2p() == nullptr
+                                       && np->op3p() == nullptr && np->op4p() == nullptr);
+                    if (leaf) {
+                        ++leafNodes;
+                    } else {
+                        ++nonLeaf;
+                        const uint32_t h = hasher(np).value();
+                        if (seen[h]++ == 0) ++distinctNonLeaf;
+                    }
+                });
+                if (sz <= 1) {
+                    ++rootSz1;
+                } else if (sz == 2) {
+                    ++rootSz2;
+                } else if (sz <= 5) {
+                    ++rootSz3to5;
+                } else {
+                    ++rootSzBig;
+                }
+            });
+        }
+        const uint64_t redundant = nonLeaf - distinctNonLeaf;
+        std::cerr << "[trace-cse-stats] funcs=" << nFunc << " incs=" << nInc
+                  << " nodes=" << totalNodes << " leaf=" << leafNodes << " nonleaf=" << nonLeaf
+                  << " distinctNonleaf=" << distinctNonLeaf << " redundantNonleaf=" << redundant
+                  << " (" << (nonLeaf ? (100.0 * redundant / nonLeaf) : 0.0) << "% of nonleaf, "
+                  << (totalNodes ? (100.0 * redundant / totalNodes) : 0.0) << "% of all nodes)\n";
+        std::cerr << "[trace-cse-stats] root-size hist: sz<=1(VarRef)=" << rootSz1
+                  << " sz==2=" << rootSz2 << " sz3-5=" << rootSz3to5 << " sz>5=" << rootSzBig
+                  << "\n";
     }
 
     TraceCFuncVertex* getCFuncVertexp(AstCFunc* nodep) {
