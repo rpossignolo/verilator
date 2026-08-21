@@ -1493,10 +1493,10 @@ class HierIfaceFlattenVisitor final : public VNVisitor {
                 AstVar* const memVarp = findMemberVar(ifacep, mvr->name());
                 UASSERT_OBJ(memVarp && memVarp->childDTypep(), mvr,
                             "Modport member not found in interface");
-                AstVar* const newp
-                    = new AstVar{portp->fileline(), VVarType::PORT,
-                                 memberName(portp->name(), mvr->name()), VFlagChildDType{},
-                                 memVarp->childDTypep()->cloneTree(false)};
+                // Clone the member var so its net/var-ness and dtype carry to the port,
+                // then make it a directional boundary port.
+                AstVar* const newp = memVarp->cloneTree(false);
+                newp->name(memberName(portp->name(), mvr->name()));
                 newp->direction(mvr->direction());
                 newp->declDirection(mvr->direction());
                 portp->addNextHere(newp);
