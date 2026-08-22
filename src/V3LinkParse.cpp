@@ -1440,6 +1440,7 @@ class HierIfaceFlattenVisitor final : public VNVisitor {
     // Flattened port name -> ordered generated member-port names (for the AstPort list)
     std::map<std::string, std::vector<std::string>> m_portMembers;
     std::set<std::string> m_arrayPorts;  // Flattened ports that were interface arrays
+    std::set<std::string> m_carriedImports;  // Package imports already copied into the block
 
     // Single-underscore tag: '__' would trip Verilator's reserved-name encoding and
     // mangle the child<->parent round-trip through the generated wrapper .sv.
@@ -1461,6 +1462,16 @@ class HierIfaceFlattenVisitor final : public VNVisitor {
             if (AstVar* const vp = VN_CAST(np, Var))
                 if (vp->name() == name) return vp;
         return nullptr;
+    }
+    // Copy the boundary interface's package imports into the block module, so the cloned
+    // package-typed member ports resolve in the child (the block itself does not import them).
+    void carryPackageImports(AstNodeModule* modp, AstIface* ifacep) {
+        for (AstNode* np = ifacep->stmtsp(); np; np = np->nextp()) {
+            AstPackageImport* const impp = VN_CAST(np, PackageImport);
+            if (!impp) continue;
+            if (!m_carriedImports.insert(impp->pkgName() + "\t" + impp->name()).second) continue;
+            modp->addStmtsp(impp->cloneTree(false));
+        }
     }
     // Enumerate constant array element indices; false if the bound isn't compile-time
     static bool arrayIndices(AstNode* elementsp, std::vector<int>& out) {
@@ -1531,6 +1542,7 @@ class HierIfaceFlattenVisitor final : public VNVisitor {
                                                  << portp->prettyNameQ());
                 continue;
             }
+            carryPackageImports(modp, ifacep);
             m_portMembers[portp->name()];  // Ensure an entry even if the modport is empty
             if (bdt) {
                 m_arrayPorts.insert(portp->name());
@@ -1552,6 +1564,7 @@ class HierIfaceFlattenVisitor final : public VNVisitor {
         m_nextPin = 0;
         m_portMembers.clear();
         m_arrayPorts.clear();
+        m_carriedImports.clear();
     }
 
     // VISITORS
