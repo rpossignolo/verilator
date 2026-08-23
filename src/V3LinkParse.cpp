@@ -1457,6 +1457,13 @@ class HierIfaceFlattenVisitor final : public VNVisitor {
                 if (mp->name() == name) return mp;
         return nullptr;
     }
+    // Descend any index/range selects (member[i], member[hi:lo]) to the base member ref,
+    // so an indexed boundary-port member access is rewritten like a plain one.
+    static AstParseRef* memberBaseOf(AstNodeExpr* rhsp) {
+        AstNodeExpr* p = rhsp;
+        while (AstNodePreSel* const selp = VN_CAST(p, NodePreSel)) p = selp->fromp();
+        return VN_CAST(p, ParseRef);
+    }
     static AstVar* findMemberVar(AstIface* ifacep, const std::string& name) {
         for (AstNode* np = ifacep->stmtsp(); np; np = np->nextp())
             if (AstVar* const vp = VN_CAST(np, Var))
@@ -1585,34 +1592,38 @@ class HierIfaceFlattenVisitor final : public VNVisitor {
     }
     void visit(AstDot* nodep) override {
         if (m_flatModp && !nodep->colon()) {
-            const AstParseRef* const rhsp = VN_CAST(nodep->rhsp(), ParseRef);
-            const AstParseRef* const lhsp = VN_CAST(nodep->lhsp(), ParseRef);
-            const AstSelBit* const selp = VN_CAST(nodep->lhsp(), SelBit);
-            // Scalar: port.member
-            if (rhsp && lhsp && !lhsp->lhsp() && m_portMembers.count(lhsp->name())
-                && !m_arrayPorts.count(lhsp->name())) {
-                nodep->replaceWith(new AstParseRef{nodep->fileline(),
-                                                   memberName(lhsp->name(), rhsp->name())});
-                VL_DO_DANGLING(nodep->deleteTree(), nodep);
-                return;
-            }
-            // Array: port[const].member
-            if (rhsp && selp) {
-                const AstParseRef* const basep = VN_CAST(selp->fromp(), ParseRef);
-                if (basep && m_arrayPorts.count(basep->name())) {
-                    const AstConst* const idxp = VN_CAST(selp->bitp(), Const);
-                    if (!idxp) {
-                        basep->v3warn(E_UNSUPPORTED,
-                                      "Unsupported: variable index into a hier_block interface "
-                                      "array port: "
-                                          << basep->prettyNameQ());
-                    } else {
-                        nodep->replaceWith(new AstParseRef{
-                            nodep->fileline(),
-                            arrMemberName(basep->name(), idxp->toSInt(), rhsp->name())});
-                        VL_DO_DANGLING(nodep->deleteTree(), nodep);
-                        return;
+            // Member is the base ref under any index/range selects on the Dot rhs
+            AstParseRef* const memberp = memberBaseOf(VN_CAST(nodep->rhsp(), NodeExpr));
+            if (memberp && !memberp->lhsp()) {
+                const AstParseRef* const lhsp = VN_CAST(nodep->lhsp(), ParseRef);
+                const AstSelBit* const selp = VN_CAST(nodep->lhsp(), SelBit);
+                std::string newName;
+                // Scalar boundary port: port.member[...]
+                if (lhsp && !lhsp->lhsp() && m_portMembers.count(lhsp->name())
+                    && !m_arrayPorts.count(lhsp->name())) {
+                    newName = memberName(lhsp->name(), memberp->name());
+                } else if (selp) {  // Array boundary port: port[const].member[...]
+                    const AstParseRef* const basep = VN_CAST(selp->fromp(), ParseRef);
+                    if (basep && m_arrayPorts.count(basep->name())) {
+                        const AstConst* const idxp = VN_CAST(selp->bitp(), Const);
+                        if (!idxp) {
+                            basep->v3warn(E_UNSUPPORTED,
+                                          "Unsupported: variable index into a hier_block interface "
+                                          "array port: "
+                                              << basep->prettyNameQ());
+                        } else {
+                            newName = arrMemberName(basep->name(), idxp->toSInt(),
+                                                    memberp->name());
+                        }
                     }
+                }
+                if (!newName.empty()) {
+                    // Rename the member base in place, then hoist the (indexed) rhs over the Dot
+                    memberp->name(newName);
+                    AstNodeExpr* const rhsp = VN_AS(nodep->rhsp(), NodeExpr)->unlinkFrBack();
+                    nodep->replaceWith(rhsp);
+                    VL_DO_DANGLING(nodep->deleteTree(), nodep);
+                    return;
                 }
             }
         }
