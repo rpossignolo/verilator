@@ -3113,6 +3113,16 @@ void LinkDotState::computeIfaceModSyms() {
     for (const auto& itr : m_ifaceModSyms) {
         AstIface* const nodep = itr.first;
         VSymEnt* const symp = itr.second;
+        // A hier_block child records an interface per reference context; some are member-less
+        // shells whose modports would spuriously error "Modport item not found" — skip those.
+        bool shell = false;
+        for (AstNode* stp = nodep->stmtsp(); stp; stp = stp->nextp()) {
+            if (const AstVar* const vp = VN_CAST(stp, Var)) {
+                shell = !symp->findIdFlat(vp->name());
+                break;
+            }
+        }
+        if (shell) continue;
         LinkDotIfaceVisitor{nodep, symp, this};
     }
     m_ifaceModSyms.clear();
