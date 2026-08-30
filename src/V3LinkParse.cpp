@@ -1529,9 +1529,14 @@ class HierIfaceFlattenVisitor final : public VNVisitor {
         m_flatModp = modp;
         for (AstVar* const portp : ports) {
             AstNodeDType* const dtp = portp->childDTypep();
+            // Size-form arrays ([N]) parse to BracketArrayDType; range-form ([hi:lo],
+            // incl. param bounds) parse to UnpackArrayDType. Handle both.
             const AstBracketArrayDType* const bdt = VN_CAST(dtp, BracketArrayDType);
-            const AstIfaceRefDType* const idt
-                = VN_CAST(bdt ? bdt->childDTypep() : dtp, IfaceRefDType);
+            const AstUnpackArrayDType* const udt = VN_CAST(dtp, UnpackArrayDType);
+            const bool isArray = bdt || udt;
+            AstNodeDType* const elemDtp = bdt ? bdt->childDTypep() : (udt ? udt->subDTypep() : dtp);
+            AstNode* const arrElemsp = bdt ? bdt->elementsp() : (udt ? udt->rangep() : nullptr);
+            const AstIfaceRefDType* const idt = VN_CAST(elemDtp, IfaceRefDType);
             AstIface* const ifacep = idt ? idt->ifacep() : nullptr;
             AstModport* const mpp = (ifacep && idt && !idt->modportName().empty())
                                         ? findModport(ifacep, idt->modportName())
@@ -1543,7 +1548,7 @@ class HierIfaceFlattenVisitor final : public VNVisitor {
                 continue;
             }
             std::vector<int> indices;
-            if (bdt && !arrayIndices(bdt->elementsp(), indices)) {
+            if (isArray && !arrayIndices(arrElemsp, indices)) {
                 portp->v3warn(E_UNSUPPORTED, "Unsupported: hier_block interface array port with "
                                              "non-constant bound: "
                                                  << portp->prettyNameQ());
@@ -1551,7 +1556,7 @@ class HierIfaceFlattenVisitor final : public VNVisitor {
             }
             carryPackageImports(modp, ifacep);
             m_portMembers[portp->name()];  // Ensure an entry even if the modport is empty
-            if (bdt) {
+            if (isArray) {
                 m_arrayPorts.insert(portp->name());
                 for (const int e : indices)
                     for (AstNode* mnp = mpp->varsp(); mnp; mnp = mnp->nextp())
