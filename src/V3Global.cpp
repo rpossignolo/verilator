@@ -24,6 +24,7 @@
 #include "V3HierBlock.h"
 #include "V3LibMap.h"
 #include "V3LinkCells.h"
+#include "V3LinkParse.h"
 #include "V3Parse.h"
 #include "V3ParseImp.h"
 #include "V3PreShell.h"
@@ -144,6 +145,8 @@ void V3Global::readFiles() {
     V3Error::abortIfErrors();
 
     if (!v3Global.opt.preprocOnly() || v3Global.opt.preprocResolve()) {
+        // Rebuild forwarded hier_block interface ports as instances, so V3LinkCells registers them
+        V3LinkParse::hierForwardPrelink(v3Global.rootp());
         // Resolve all modules cells refer to
         V3LinkCells::link(v3Global.rootp(), &filter);
     }

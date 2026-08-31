@@ -27,6 +27,8 @@ class AstNetlist;
 class V3LinkParse final {
 public:
     static void linkParse(AstNetlist* rootp) VL_MT_DISABLED;
+    // Rebuild forwarded hier_block interface ports as instances, before V3LinkCells
+    static void hierForwardPrelink(AstNetlist* rootp) VL_MT_DISABLED;
 };
 
 #endif  // Guard

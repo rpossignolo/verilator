@@ -1426,6 +1426,158 @@ public:
 };
 
 //######################################################################
+// Hier-block interface-port FORWARDING (child side, runs BEFORE V3LinkCells)
+// A boundary interface handed whole to a submodule pin can't be member-flattened; rebuild
+// it as an internal interface instance wired to flat DPI ports. The instance is created
+// before V3LinkCells so it is registered like a source cell and member XMRs into it resolve.
+
+class HierIfaceForwardVisitor final {
+    AstNetlist* const m_netlistp;
+    int m_nextPin = 0;
+
+    static std::string memberName(const std::string& port, const std::string& member) {
+        return port + "_ifm_" + member;
+    }
+    AstIface* findIfaceByName(const std::string& name) {
+        for (AstNode* np = m_netlistp->modulesp(); np; np = np->nextp())
+            if (AstIface* const ifp = VN_CAST(np, Iface))
+                if (ifp->name() == name) return ifp;
+        return nullptr;
+    }
+    static AstModport* findModport(AstIface* ifacep, const std::string& name) {
+        for (AstNode* np = ifacep->stmtsp(); np; np = np->nextp())
+            if (AstModport* const mp = VN_CAST(np, Modport))
+                if (mp->name() == name) return mp;
+        return nullptr;
+    }
+    static AstVar* findMemberVar(AstIface* ifacep, const std::string& name) {
+        for (AstNode* np = ifacep->stmtsp(); np; np = np->nextp())
+            if (AstVar* const vp = VN_CAST(np, Var))
+                if (vp->name() == name) return vp;
+        return nullptr;
+    }
+    // Whole-interface handoff to a submodule pin; rename such refs to newName when given.
+    static bool forwarded(AstNodeModule* modp, const std::string& name,
+                          const std::string& newName = "") {
+        bool found = false;
+        for (AstNode* np = modp->stmtsp(); np; np = np->nextp()) {
+            const AstCell* const cellp = VN_CAST(np, Cell);
+            if (!cellp) continue;
+            for (AstNode* pp = cellp->pinsp(); pp; pp = pp->nextp()) {
+                const AstPin* const pinp = VN_CAST(pp, Pin);
+                if (!pinp || !pinp->exprp()) continue;
+                AstNode* e = pinp->exprp();
+                while (AstNodePreSel* const sp = VN_CAST(e, NodePreSel)) e = sp->fromp();
+                AstParseRef* const rp = VN_CAST(e, ParseRef);
+                if (rp && !rp->lhsp() && rp->name() == name) {
+                    found = true;
+                    if (!newName.empty()) rp->name(newName);
+                }
+            }
+        }
+        return found;
+    }
+    void deletePort(AstNodeModule* modp, const std::string& name, AstVar* portp) {
+        for (AstNode* np = modp->stmtsp(); np;) {
+            AstNode* const nxt = np->nextp();
+            if (AstPort* const pp = VN_CAST(np, Port))
+                if (pp->name() == name) VL_DO_DANGLING(pp->unlinkFrBack()->deleteTree(), pp);
+            np = nxt;
+        }
+        VL_DO_DANGLING(portp->unlinkFrBack()->deleteTree(), portp);
+    }
+    // True if the modport exposes any internal (non-port) interface member. Forwarding these
+    // needs a flat-port<->iface-member bridge that V3Inline strands unscoped; not yet supported.
+    static bool hasInternalMember(AstIface* ifacep, AstModport* mpp) {
+        for (AstNode* mnp = mpp->varsp(); mnp; mnp = mnp->nextp())
+            if (const AstModportVarRef* const mvr = VN_CAST(mnp, ModportVarRef)) {
+                AstVar* const memVarp = findMemberVar(ifacep, mvr->name());
+                if (memVarp && !memVarp->isIO()) return true;
+            }
+        return false;
+    }
+    void reconstruct(AstNodeModule* modp, AstVar* portp, AstIface* ifacep, AstModport* mpp) {
+        FileLine* const fl = portp->fileline();
+        const std::string nm = portp->name();
+        const std::string inst = nm + "__Vhbfwd";
+        AstNode* portAstTailp = nullptr;
+        for (AstNode* np = modp->stmtsp(); np; np = np->nextp())
+            if (AstPort* const pp = VN_CAST(np, Port))
+                if (pp->name() == nm) portAstTailp = pp;
+        AstPin* pinsp = nullptr;  // instance pins for the interface's own ports
+        int pinnum = 0;
+        for (AstNode* mnp = mpp->varsp(); mnp; mnp = mnp->nextp()) {
+            const AstModportVarRef* const mvr = VN_CAST(mnp, ModportVarRef);
+            if (!mvr) continue;
+            AstVar* const memVarp = findMemberVar(ifacep, mvr->name());
+            if (!memVarp || !memVarp->childDTypep()) continue;
+            const std::string flatName = memberName(nm, mvr->name());
+            // Flat DPI boundary port cloned from the interface member
+            AstVar* const fv = memVarp->cloneTree(false);
+            fv->name(flatName);
+            fv->direction(mvr->direction());
+            fv->declDirection(mvr->direction());
+            portp->addNextHere(fv);
+            AstPort* const newPortp = new AstPort{fl, ++m_nextPin, flatName};
+            if (portAstTailp) {
+                portAstTailp->addNextHere(newPortp);
+                portAstTailp = newPortp;
+            } else {
+                modp->addStmtsp(newPortp);
+            }
+            // Interface's own port: connect it to the matching flat DPI port
+            AstPin* const pinp
+                = new AstPin{fl, ++pinnum, mvr->name(), new AstParseRef{fl, flatName}};
+            if (!pinsp) pinsp = pinp;
+            else pinsp->addNext(pinp);
+        }
+        // Raw interface instance; V3LinkCells resolves it (sets modp, __Viftop) so XMRs link
+        AstCell* const cellp = new AstCell{fl, fl, inst, ifacep->name(), pinsp, nullptr, nullptr};
+        modp->addStmtsp(cellp);
+        forwarded(modp, nm, inst);  // Re-point submodule pins to the rebuilt instance
+        deletePort(modp, nm, portp);
+    }
+    void processModule(AstNodeModule* modp) {
+        std::set<std::string> portNames;
+        for (AstNode* np = modp->stmtsp(); np; np = np->nextp())
+            if (const AstPort* const pp = VN_CAST(np, Port)) {
+                portNames.insert(pp->name());
+                m_nextPin = std::max(m_nextPin, pp->pinNum());
+            }
+        std::vector<AstVar*> ports;
+        for (AstNode* np = modp->stmtsp(); np; np = np->nextp())
+            if (AstVar* const vp = VN_CAST(np, Var))
+                if (portNames.count(vp->name()) && VN_IS(vp->childDTypep(), IfaceRefDType))
+                    ports.push_back(vp);
+        for (AstVar* const portp : ports) {
+            AstIfaceRefDType* const idt = VN_CAST(portp->childDTypep(), IfaceRefDType);
+            if (idt->modportName().empty()) continue;
+            if (!forwarded(modp, portp->name())) continue;  // member-access ports: linkParse flatten
+            AstIface* const ifacep = findIfaceByName(idt->ifaceName());
+            if (!ifacep) continue;
+            AstModport* const mpp = findModport(ifacep, idt->modportName());
+            if (!mpp) continue;
+            if (hasInternalMember(ifacep, mpp)) {
+                portp->v3warn(E_UNSUPPORTED,
+                              "Unsupported: hier_block interface port forwarded to a submodule "
+                              "with internal (non-port) members: "
+                                  << portp->prettyNameQ());
+                continue;
+            }
+            reconstruct(modp, portp, ifacep, mpp);
+        }
+    }
+
+public:
+    explicit HierIfaceForwardVisitor(AstNetlist* rootp)
+        : m_netlistp{rootp} {
+        for (AstNode* np = rootp->modulesp(); np; np = np->nextp())
+            if (AstNodeModule* const modp = VN_CAST(np, NodeModule))
+                if (modp->name() == v3Global.opt.topModule()) processModule(modp);
+    }
+};
+
+//######################################################################
 // Hier-block interface-port flattening (child side)
 // Interface types can't cross the hier_block separate-compile ABI, so the child (which
 // verilates the block as top) splits each boundary iface/modport port into plain member
@@ -1642,6 +1794,13 @@ public:
 
 //######################################################################
 // Link class functions
+
+void V3LinkParse::hierForwardPrelink(AstNetlist* rootp) {
+    UINFO(4, __FUNCTION__ << ": ");
+    if (!v3Global.opt.hierChild()) return;
+    { HierIfaceForwardVisitor{rootp}; }
+    V3Error::abortIfErrors();  // Stop cleanly on an unsupported boundary before V3LinkCells
+}
 
 void V3LinkParse::linkParse(AstNetlist* rootp) {
     UINFO(4, __FUNCTION__ << ": ");
