@@ -1545,6 +1545,105 @@ static bool hierArrayIndices(AstNetlist* netlistp, AstNode* elementsp, std::vect
 }
 
 //######################################################################
+// Hier-block boundary direction inference for an UNMODPORTED interface port
+// The RTL convention is moving to plain interface handles, so a boundary port often carries
+// no modport to take member directions from. Only the child decides the wrapper's port list
+// -- the parent reconnects purely by name (V3LinkCells::expandHierIfacePins) -- so the block
+// can settle directions on its own. The ground truth is who drives what: a member the block
+// assigns anywhere inside is an output, everything else an input.
+
+static AstNodeModule* hierFindModule(AstNetlist* netlistp, const std::string& name) {
+    for (AstNode* np = netlistp->modulesp(); np; np = np->nextp())
+        if (AstNodeModule* const modp = VN_CAST(np, NodeModule))
+            if (!VN_IS(modp, Iface) && !VN_IS(modp, Package) && modp->name() == name) return modp;
+    return nullptr;
+}
+
+// Strip index/slice wrappers to the underlying reference
+static const AstNode* hierStripSel(const AstNode* nodep) {
+    while (const AstNodePreSel* const selp = VN_CAST(nodep, NodePreSel)) nodep = selp->fromp();
+    return nodep;
+}
+
+// If nodep is '<base>.<member>' return the member name; either side may carry an index,
+// as a bit- or element-select binds tighter than the dot ('if.member[i] = ...').
+static std::string hierDotMember(const AstNode* nodep, const std::string& base) {
+    const AstDot* const dotp = VN_CAST(nodep, Dot);
+    if (!dotp) return "";
+    const AstParseRef* const lp = VN_CAST(hierStripSel(dotp->lhsp()), ParseRef);
+    const AstParseRef* const rp = VN_CAST(hierStripSel(dotp->rhsp()), ParseRef);
+    if (!lp || !rp || lp->lhsp() || lp->name() != base) return "";
+    return rp->name();
+}
+
+// Port var of modp connected by pinp, by name or, for a positional pin, by order
+static AstVar* hierPinPortVar(AstNodeModule* modp, const AstPin* pinp) {
+    if (!modp) return nullptr;
+    int idx = 0;
+    for (AstNode* np = modp->stmtsp(); np; np = np->nextp()) {
+        AstVar* const vp = VN_CAST(np, Var);
+        if (!vp || !vp->isIO()) continue;
+        ++idx;
+        if (!pinp->name().empty() && pinp->name()[0] != '_') {
+            if (vp->name() == pinp->name()) return vp;
+        } else if (idx == pinp->pinNum()) {
+            return vp;
+        }
+    }
+    return nullptr;
+}
+
+// Members of the boundary interface that the block drives, following the handle wherever it
+// is passed on to a submodule.
+static void hierCollectDriven(AstNetlist* netlistp, AstNodeModule* modp, const std::string& base,
+                              std::set<std::pair<AstNodeModule*, std::string>>& seen,
+                              std::set<std::string>& driven) {
+    if (!modp || !seen.insert({modp, base}).second) return;
+    // Assigned inside this module
+    modp->foreach([&](AstNodeAssign* asgp) {
+        asgp->lhsp()->foreach([&](AstDot* dotp) {
+            const std::string member = hierDotMember(dotp, base);
+            if (!member.empty()) driven.insert(member);
+        });
+    });
+    // Handed to a submodule, whole or member by member
+    modp->foreach([&](AstCell* cellp) {
+        AstNodeModule* const subp
+            = cellp->modp() ? cellp->modp() : hierFindModule(netlistp, cellp->modName());
+        for (AstNode* pp = cellp->pinsp(); pp; pp = pp->nextp()) {
+            const AstPin* const pinp = VN_CAST(pp, Pin);
+            if (!pinp || !pinp->exprp() || pinp->param()) continue;
+            const AstNode* const exprp = hierStripSel(pinp->exprp());
+            const std::string member = hierDotMember(exprp, base);
+            if (!member.empty()) {
+                const AstVar* const portp = hierPinPortVar(subp, pinp);
+                if (portp && portp->direction().isWritable()) driven.insert(member);
+                continue;
+            }
+            const AstParseRef* const refp = VN_CAST(exprp, ParseRef);
+            if (refp && !refp->lhsp() && refp->name() == base && subp) {
+                const AstVar* const portp = hierPinPortVar(subp, pinp);
+                if (portp) hierCollectDriven(netlistp, subp, portp->name(), seen, driven);
+            }
+        }
+    });
+}
+
+// Ordered (member, direction) list for an unmodported boundary interface port
+static void hierInferMemberDirs(AstNetlist* netlistp, AstNodeModule* blockp,
+                                const std::string& portName, AstIface* ifacep,
+                                std::vector<std::pair<AstVar*, VDirection>>& out) {
+    std::set<std::pair<AstNodeModule*, std::string>> seen;
+    std::set<std::string> driven;
+    hierCollectDriven(netlistp, blockp, portName, seen, driven);
+    for (AstNode* np = ifacep->stmtsp(); np; np = np->nextp()) {
+        AstVar* const vp = VN_CAST(np, Var);
+        if (!vp || vp->isParam() || !vp->childDTypep()) continue;
+        out.emplace_back(vp, driven.count(vp->name()) ? VDirection::OUTPUT : VDirection::INPUT);
+    }
+}
+
+//######################################################################
 // Hier-block interface-port FORWARDING (child side, runs BEFORE V3LinkCells)
 // A boundary interface handed whole to a submodule pin can't be member-flattened; rebuild
 // it as an internal interface instance wired to flat DPI ports -- by instance pin for the
@@ -1634,13 +1733,10 @@ class HierIfaceForwardVisitor final {
         }
         VL_DO_DANGLING(portp->unlinkFrBack()->deleteTree(), portp);
     }
-    // True if the modport exposes any of the interface's own ports (vs internal members)
-    static bool hasPortMember(AstIface* ifacep, AstModport* mpp) {
-        for (AstNode* mnp = mpp->varsp(); mnp; mnp = mnp->nextp())
-            if (const AstModportVarRef* const mvr = VN_CAST(mnp, ModportVarRef)) {
-                AstVar* const memVarp = findMemberVar(ifacep, mvr->name());
-                if (memVarp && memVarp->isIO()) return true;
-            }
+    // True if any boundary member is one of the interface's own ports (vs an internal member)
+    static bool hasPortMember(const std::vector<std::pair<AstVar*, VDirection>>& members) {
+        for (const auto& mem : members)
+            if (mem.first->isIO()) return true;
         return false;
     }
     // Copy the boundary interface's package imports into the block module, so the cloned
@@ -1654,7 +1750,8 @@ class HierIfaceForwardVisitor final {
         }
     }
     // `elems` empty means a scalar port; otherwise one boundary port set per element.
-    void reconstruct(AstNodeModule* modp, AstVar* portp, AstIface* ifacep, AstModport* mpp,
+    void reconstruct(AstNodeModule* modp, AstVar* portp, AstIface* ifacep,
+                     const std::vector<std::pair<AstVar*, VDirection>>& members,
                      const std::vector<int>& elems) {
         FileLine* const fl = portp->fileline();
         const std::string nm = portp->name();
@@ -1669,19 +1766,17 @@ class HierIfaceForwardVisitor final {
         // One pass over the members per array element (a single pass for a scalar port)
         const std::vector<int> pass = elems.empty() ? std::vector<int>{0} : elems;
         for (const int e : pass) {
-            for (AstNode* mnp = mpp->varsp(); mnp; mnp = mnp->nextp()) {
-                const AstModportVarRef* const mvr = VN_CAST(mnp, ModportVarRef);
-                if (!mvr) continue;
-                AstVar* const memVarp = findMemberVar(ifacep, mvr->name());
-                if (!memVarp || !memVarp->childDTypep()) continue;
+            for (const auto& mem : members) {
+                AstVar* const memVarp = mem.first;
+                const VDirection dir = mem.second;
                 const std::string flatName = elems.empty()
-                                                 ? memberName(nm, mvr->name())
-                                                 : arrMemberName(nm, e, mvr->name());
+                                                 ? memberName(nm, memVarp->name())
+                                                 : arrMemberName(nm, e, memVarp->name());
                 // Flat DPI boundary port cloned from the interface member
                 AstVar* const fv = memVarp->cloneTree(false);
                 fv->name(flatName);
-                fv->direction(mvr->direction());
-                fv->declDirection(mvr->direction());
+                fv->direction(dir);
+                fv->declDirection(dir);
                 hierFoldMemberDims(m_netlistp, ifacep, fv->childDTypep());
                 portp->addNextHere(fv);
                 AstPort* const newPortp = new AstPort{fl, ++m_nextPin, flatName};
@@ -1694,7 +1789,7 @@ class HierIfaceForwardVisitor final {
                 if (memVarp->isIO()) {
                     // Interface's own port: connect it to the matching flat DPI port
                     AstPin* const pinp
-                        = new AstPin{fl, ++pinnum, mvr->name(), new AstParseRef{fl, flatName}};
+                        = new AstPin{fl, ++pinnum, memVarp->name(), new AstParseRef{fl, flatName}};
                     if (!pinsp) pinsp = pinp;
                     else pinsp->addNext(pinp);
                 } else {
@@ -1704,9 +1799,9 @@ class HierIfaceForwardVisitor final {
                         basep = new AstSelBit{fl, basep,
                                               new AstConst{fl, static_cast<uint32_t>(e)}};
                     AstNodeExpr* const memp
-                        = new AstDot{fl, false, basep, new AstParseRef{fl, mvr->name()}};
+                        = new AstDot{fl, false, basep, new AstParseRef{fl, memVarp->name()}};
                     AstNodeExpr* const flatp = new AstParseRef{fl, flatName};
-                    AstAssignW* const asgp = mvr->direction().isNonOutput()
+                    AstAssignW* const asgp = dir.isNonOutput()
                                                  ? new AstAssignW{fl, memp, flatp}
                                                  : new AstAssignW{fl, flatp, memp};
                     // Wrap like the parser does: a bare AssignW is stranded unscoped by V3Inline
@@ -1744,14 +1839,32 @@ class HierIfaceForwardVisitor final {
             const AstUnpackArrayDType* const udt = VN_CAST(dtp, UnpackArrayDType);
             AstNodeDType* const elemDtp
                 = bdt ? bdt->childDTypep() : (udt ? udt->childDTypep() : dtp);
+            // A modport-qualified port is an IfaceRefDType already; a plain handle is still
+            // an unresolved RefDType naming the interface until V3LinkDot gets to it.
             AstIfaceRefDType* const idt = VN_CAST(elemDtp, IfaceRefDType);
-            if (!idt || idt->modportName().empty()) continue;
+            const AstRefDType* const rdt = VN_CAST(elemDtp, RefDType);
+            if (!idt && !rdt) continue;
+            AstIface* const ifacep
+                = findIfaceByName(idt ? idt->ifaceName() : rdt->name());
+            if (!ifacep) continue;
             // member-access ports: linkParse flatten
             if (!forwarded(modp->stmtsp(), portp->name())) continue;
-            AstIface* const ifacep = findIfaceByName(idt->ifaceName());
-            if (!ifacep) continue;
-            AstModport* const mpp = findModport(ifacep, idt->modportName());
-            if (!mpp) continue;
+            // A plain interface handle carries no modport, so settle directions from use
+            std::vector<std::pair<AstVar*, VDirection>> members;
+            if (!idt || idt->modportName().empty()) {
+                hierInferMemberDirs(m_netlistp, modp, portp->name(), ifacep, members);
+            } else {
+                AstModport* const mpp = findModport(ifacep, idt->modportName());
+                if (!mpp) continue;
+                for (AstNode* mnp = mpp->varsp(); mnp; mnp = mnp->nextp()) {
+                    const AstModportVarRef* const mvr = VN_CAST(mnp, ModportVarRef);
+                    if (!mvr) continue;
+                    AstVar* const memVarp = findMemberVar(ifacep, mvr->name());
+                    if (!memVarp || !memVarp->childDTypep()) continue;
+                    members.emplace_back(memVarp, mvr->direction());
+                }
+            }
+            if (members.empty()) continue;
             std::vector<int> elems;
             if (bdt || udt) {
                 AstNode* const arrElemsp = bdt ? bdt->elementsp() : udt->rangep();
@@ -1762,7 +1875,7 @@ class HierIfaceForwardVisitor final {
                                       << portp->prettyNameQ());
                     continue;
                 }
-                if (hasPortMember(ifacep, mpp)) {
+                if (hasPortMember(members)) {
                     // A cell array takes one pin expression for all elements, so an interface
                     // with its own ports can't be rebuilt per element.
                     portp->v3warn(E_UNSUPPORTED,
@@ -1773,7 +1886,7 @@ class HierIfaceForwardVisitor final {
                 }
             }
             carryPackageImports(modp, ifacep);
-            reconstruct(modp, portp, ifacep, mpp, elems);
+            reconstruct(modp, portp, ifacep, members, elems);
         }
     }
 
