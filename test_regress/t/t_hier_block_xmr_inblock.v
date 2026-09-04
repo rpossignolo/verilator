@@ -13,12 +13,15 @@ module deep (input clk, output logic [7:0] o);
 endmodule
 module inner (input clk, output logic [7:0] o);
   deep u (.clk(clk), .o(o));
-  // Absolute XMR through the block instance name -- illegal once `sub` is a black box
-  always @(posedge clk)
-    if (sub.inner_i.u.acc == 8'hFF) $display("wrap");
+  // Both forms are rooted at the block instance and stay inside it
+  always @(posedge clk) begin
+    if (sub.inner_i.u.acc == 8'hFF) $display("wrap");   // scope traversal into the block
+    if (sub.internal_q !== 8'h5A) $stop;                // non-port symbol of the block
+  end
 endmodule
 module sub (input clk, output logic [7:0] o);
   /*verilator hier_block*/
+  logic [7:0] internal_q = 8'h5A;  // Non-port symbol, named directly from inside the block
   inner inner_i (.clk(clk), .o(o));
 endmodule
 module t;

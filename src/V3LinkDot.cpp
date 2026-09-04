@@ -3862,6 +3862,8 @@ class LinkDotResolveVisitor final : public VNVisitor {
         // Ok if not a hier_block
         const AstNodeModule* const modp = cellp->modp();
         if (!modp->hierBlock()) return false;
+        // OK from inside that same block: both ends land in one --lib-create child
+        if (m_statep->refWithinBlock(modp)) return false;
         // Bad
         refp->v3error("Cannot access non-port symbols inside hierarchical block");
         return true;
