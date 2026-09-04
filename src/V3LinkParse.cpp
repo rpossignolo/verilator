@@ -1581,31 +1581,49 @@ class HierIfaceForwardVisitor final {
                 if (vp->name() == name) return vp;
         return nullptr;
     }
-    // Whole-interface handoff to a submodule pin; rename such refs to newName when given.
-    // Walks the whole module body: the handoff is often inside a generate block.
-    static bool forwarded(AstNode* nodep, const std::string& name,
-                          const std::string& newName = "") {
-        bool found = false;
+    // True if the interface is handed whole to a submodule pin, which is what makes the port
+    // unflattenable. Walks the whole module body: the handoff is often in a generate block.
+    static bool forwarded(AstNode* nodep, const std::string& name) {
         for (AstNode* np = nodep; np; np = np->nextp()) {
             if (const AstCell* const cellp = VN_CAST(np, Cell)) {
                 for (AstNode* pp = cellp->pinsp(); pp; pp = pp->nextp()) {
                     const AstPin* const pinp = VN_CAST(pp, Pin);
                     if (!pinp || !pinp->exprp()) continue;
                     AstNode* e = pinp->exprp();
-                    while (AstNodePreSel* const sp = VN_CAST(e, NodePreSel)) e = sp->fromp();
-                    AstParseRef* const rp = VN_CAST(e, ParseRef);
-                    if (rp && !rp->lhsp() && rp->name() == name) {
-                        found = true;
-                        if (!newName.empty()) rp->name(newName);
-                    }
+                    while (const AstNodePreSel* const sp = VN_CAST(e, NodePreSel)) e = sp->fromp();
+                    const AstParseRef* const rp = VN_CAST(e, ParseRef);
+                    if (rp && !rp->lhsp() && rp->name() == name) return true;
                 }
             }
-            if (np->op1p() && forwarded(np->op1p(), name, newName)) found = true;
-            if (np->op2p() && forwarded(np->op2p(), name, newName)) found = true;
-            if (np->op3p() && forwarded(np->op3p(), name, newName)) found = true;
-            if (np->op4p() && forwarded(np->op4p(), name, newName)) found = true;
+            if (np->op1p() && forwarded(np->op1p(), name)) return true;
+            if (np->op2p() && forwarded(np->op2p(), name)) return true;
+            if (np->op3p() && forwarded(np->op3p(), name)) return true;
+            if (np->op4p() && forwarded(np->op4p(), name)) return true;
         }
-        return found;
+        return false;
+    }
+    // Point every base reference to the boundary port at the rebuilt instance, so a port that
+    // is also member-accessed still resolves. The rhs of a Dot is a member name, not a base.
+    static void renameBaseRefs(AstNode* nodep, const std::string& name,
+                               const std::string& newName) {
+        for (AstNode* np = nodep; np; np = np->nextp()) {
+            if (const AstDot* const dotp = VN_CAST(np, Dot)) {
+                renameBaseRefs(dotp->lhsp(), name, newName);
+                if (AstNode* const rhsp = dotp->rhsp()) {
+                    if (rhsp->op1p()) renameBaseRefs(rhsp->op1p(), name, newName);
+                    if (rhsp->op2p()) renameBaseRefs(rhsp->op2p(), name, newName);
+                    if (rhsp->op3p()) renameBaseRefs(rhsp->op3p(), name, newName);
+                    if (rhsp->op4p()) renameBaseRefs(rhsp->op4p(), name, newName);
+                }
+                continue;
+            }
+            if (AstParseRef* const refp = VN_CAST(np, ParseRef))
+                if (!refp->lhsp() && refp->name() == name) refp->name(newName);
+            if (np->op1p()) renameBaseRefs(np->op1p(), name, newName);
+            if (np->op2p()) renameBaseRefs(np->op2p(), name, newName);
+            if (np->op3p()) renameBaseRefs(np->op3p(), name, newName);
+            if (np->op4p()) renameBaseRefs(np->op4p(), name, newName);
+        }
     }
     void deletePort(AstNodeModule* modp, const std::string& name, AstVar* portp) {
         for (AstNode* np = modp->stmtsp(); np;) {
@@ -1704,7 +1722,7 @@ class HierIfaceForwardVisitor final {
         AstCell* const cellp = new AstCell{fl, fl, inst, ifacep->name(), pinsp, nullptr, rangep};
         modp->addStmtsp(cellp);
         if (bridgesp) modp->addStmtsp(bridgesp);
-        forwarded(modp->stmtsp(), nm, inst);  // Re-point submodule pins to the rebuilt instance
+        renameBaseRefs(modp->stmtsp(), nm, inst);
         deletePort(modp, nm, portp);
     }
     void processModule(AstNodeModule* modp) {
@@ -1762,9 +1780,15 @@ class HierIfaceForwardVisitor final {
 public:
     explicit HierIfaceForwardVisitor(AstNetlist* rootp)
         : m_netlistp{rootp} {
+        // Match origName like V3LinkCells does: a parameterized block is still under its
+        // source name here, and only renamed to the mangled --top-module in V3LinkCells.
+        const V3HierBlockOptSet& hierBlocks = v3Global.opt.hierBlocks();
+        const auto hierIt = hierBlocks.find(v3Global.opt.topModule());
+        if (hierIt == hierBlocks.end()) return;
+        const std::string& origName = hierIt->second.origName();
         for (AstNode* np = rootp->modulesp(); np; np = np->nextp())
             if (AstNodeModule* const modp = VN_CAST(np, NodeModule))
-                if (modp->name() == v3Global.opt.topModule()) processModule(modp);
+                if (modp->origName() == origName) processModule(modp);
     }
 };
 
