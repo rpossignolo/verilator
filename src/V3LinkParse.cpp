@@ -1434,7 +1434,7 @@ public:
 // Value of a parameter named `name` declared in some package. Packages are searched globally
 // because resolving a bare reference properly would mean replaying LinkDot's import/export
 // graph this early; a name that two packages disagree on is treated as unresolvable.
-static bool hierEvalConst(AstNetlist* netlistp, AstNode* exprp, int& out);
+static bool hierEvalConst(AstNetlist* netlistp, AstIface* localsp, AstNode* exprp, int& out);
 
 static bool hierPkgParamValue(AstNetlist* netlistp, const std::string& pkgName,
                               const std::string& name, int& out) {
@@ -1447,7 +1447,7 @@ static bool hierPkgParamValue(AstNetlist* netlistp, const std::string& pkgName,
             AstVar* const vp = VN_CAST(sp, Var);
             if (!vp || !vp->isParam() || vp->name() != name || !vp->valuep()) continue;
             int val;
-            if (!hierEvalConst(netlistp, vp->valuep(), val)) return false;
+            if (!hierEvalConst(netlistp, nullptr, vp->valuep(), val)) return false;
             if (found && val != out) return false;
             out = val;
             found = true;
@@ -1456,7 +1456,19 @@ static bool hierPkgParamValue(AstNetlist* netlistp, const std::string& pkgName,
     return found;
 }
 
-static bool hierEvalConst(AstNetlist* netlistp, AstNode* exprp, int& out) {
+// Value of a parameter declared in the interface itself, using its declared default
+static bool hierIfaceParamValue(AstNetlist* netlistp, AstIface* ifacep, const std::string& name,
+                                int& out) {
+    if (!ifacep) return false;
+    for (AstNode* np = ifacep->stmtsp(); np; np = np->nextp()) {
+        AstVar* const vp = VN_CAST(np, Var);
+        if (!vp || !vp->isParam() || vp->name() != name || !vp->valuep()) continue;
+        return hierEvalConst(netlistp, ifacep, vp->valuep(), out);
+    }
+    return false;
+}
+
+static bool hierEvalConst(AstNetlist* netlistp, AstIface* localsp, AstNode* exprp, int& out) {
     if (!exprp) return false;
     if (const AstConst* const cp = VN_CAST(exprp, Const)) {
         out = cp->toSInt();
@@ -1464,8 +1476,8 @@ static bool hierEvalConst(AstNetlist* netlistp, AstNode* exprp, int& out) {
     }
     if (const AstNodeBiop* const bp = VN_CAST(exprp, NodeBiop)) {
         int l, r;
-        if (!hierEvalConst(netlistp, bp->lhsp(), l)) return false;
-        if (!hierEvalConst(netlistp, bp->rhsp(), r)) return false;
+        if (!hierEvalConst(netlistp, localsp, bp->lhsp(), l)) return false;
+        if (!hierEvalConst(netlistp, localsp, bp->rhsp(), r)) return false;
         if (VN_IS(bp, Add)) {
             out = l + r;
         } else if (VN_IS(bp, Sub)) {
@@ -1487,22 +1499,46 @@ static bool hierEvalConst(AstNetlist* netlistp, AstNode* exprp, int& out) {
     }
     if (const AstParseRef* const refp = VN_CAST(exprp, ParseRef)) {
         if (refp->lhsp()) return false;
+        if (hierIfaceParamValue(netlistp, localsp, refp->name(), out)) return true;
         return hierPkgParamValue(netlistp, "", refp->name(), out);
     }
     return false;
+}
+
+// Fold a cloned member port's dimensions to constants. Member widths often reference the
+// interface's own parameters, which do not exist in the block module the clone lands in.
+static void hierFoldMemberDims(AstNetlist* netlistp, AstIface* ifacep, AstNode* nodep) {
+    for (AstNode* np = nodep; np; np = np->nextp()) {
+        if (AstRange* const rp = VN_CAST(np, Range)) {
+            int v;
+            if (!VN_IS(rp->leftp(), Const) && hierEvalConst(netlistp, ifacep, rp->leftp(), v))
+                rp->leftp()->replaceWith(new AstConst{rp->fileline(), v});
+            if (!VN_IS(rp->rightp(), Const) && hierEvalConst(netlistp, ifacep, rp->rightp(), v))
+                rp->rightp()->replaceWith(new AstConst{rp->fileline(), v});
+        } else if (AstBracketArrayDType* const bp = VN_CAST(np, BracketArrayDType)) {
+            int v;
+            if (!VN_IS(bp->elementsp(), Const)
+                && hierEvalConst(netlistp, ifacep, bp->elementsp(), v))
+                bp->elementsp()->replaceWith(new AstConst{bp->fileline(), v});
+        }
+        if (np->op1p()) hierFoldMemberDims(netlistp, ifacep, np->op1p());
+        if (np->op2p()) hierFoldMemberDims(netlistp, ifacep, np->op2p());
+        if (np->op3p()) hierFoldMemberDims(netlistp, ifacep, np->op3p());
+        if (np->op4p()) hierFoldMemberDims(netlistp, ifacep, np->op4p());
+    }
 }
 
 // Enumerate an interface array port's element indices; false if the bound isn't resolvable
 static bool hierArrayIndices(AstNetlist* netlistp, AstNode* elementsp, std::vector<int>& out) {
     if (const AstRange* const rp = VN_CAST(elementsp, Range)) {
         int l, r;
-        if (!hierEvalConst(netlistp, rp->leftp(), l)) return false;
-        if (!hierEvalConst(netlistp, rp->rightp(), r)) return false;
+        if (!hierEvalConst(netlistp, nullptr, rp->leftp(), l)) return false;
+        if (!hierEvalConst(netlistp, nullptr, rp->rightp(), r)) return false;
         for (int i = std::min(l, r); i <= std::max(l, r); ++i) out.push_back(i);
         return true;
     }
     int n;
-    if (!hierEvalConst(netlistp, elementsp, n)) return false;
+    if (!hierEvalConst(netlistp, nullptr, elementsp, n)) return false;
     if (n <= 0) return false;
     for (int i = 0; i < n; ++i) out.push_back(i);
     return true;
@@ -1628,6 +1664,7 @@ class HierIfaceForwardVisitor final {
                 fv->name(flatName);
                 fv->direction(mvr->direction());
                 fv->declDirection(mvr->direction());
+                hierFoldMemberDims(m_netlistp, ifacep, fv->childDTypep());
                 portp->addNextHere(fv);
                 AstPort* const newPortp = new AstPort{fl, ++m_nextPin, flatName};
                 if (portAstTailp) {
@@ -1798,6 +1835,7 @@ class HierIfaceFlattenVisitor final : public VNVisitor {
         newp->name(newName);
         newp->direction(mvr->direction());
         newp->declDirection(mvr->direction());
+        hierFoldMemberDims(m_netlistp, ifacep, newp->childDTypep());
         portp->addNextHere(newp);
         m_portMembers[portp->name()].push_back(newName);
     }
