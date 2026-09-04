@@ -1428,12 +1428,14 @@ public:
 //######################################################################
 // Hier-block interface-port FORWARDING (child side, runs BEFORE V3LinkCells)
 // A boundary interface handed whole to a submodule pin can't be member-flattened; rebuild
-// it as an internal interface instance wired to flat DPI ports. The instance is created
-// before V3LinkCells so it is registered like a source cell and member XMRs into it resolve.
+// it as an internal interface instance wired to flat DPI ports -- by instance pin for the
+// interface's own ports, by continuous assign for its internal members. Created before
+// V3LinkCells so the instance registers like a source cell and member XMRs into it resolve.
 
 class HierIfaceForwardVisitor final {
     AstNetlist* const m_netlistp;
     int m_nextPin = 0;
+    std::set<std::string> m_carriedImports;  // Package imports already copied into the block
 
     static std::string memberName(const std::string& port, const std::string& member) {
         return port + "_ifm_" + member;
@@ -1486,15 +1488,15 @@ class HierIfaceForwardVisitor final {
         }
         VL_DO_DANGLING(portp->unlinkFrBack()->deleteTree(), portp);
     }
-    // True if the modport exposes any internal (non-port) interface member. Forwarding these
-    // needs a flat-port<->iface-member bridge that V3Inline strands unscoped; not yet supported.
-    static bool hasInternalMember(AstIface* ifacep, AstModport* mpp) {
-        for (AstNode* mnp = mpp->varsp(); mnp; mnp = mnp->nextp())
-            if (const AstModportVarRef* const mvr = VN_CAST(mnp, ModportVarRef)) {
-                AstVar* const memVarp = findMemberVar(ifacep, mvr->name());
-                if (memVarp && !memVarp->isIO()) return true;
-            }
-        return false;
+    // Copy the boundary interface's package imports into the block module, so the cloned
+    // package-typed member ports resolve in the child (the block itself does not import them).
+    void carryPackageImports(AstNodeModule* modp, AstIface* ifacep) {
+        for (AstNode* np = ifacep->stmtsp(); np; np = np->nextp()) {
+            AstPackageImport* const impp = VN_CAST(np, PackageImport);
+            if (!impp) continue;
+            if (!m_carriedImports.insert(impp->pkgName() + "\t" + impp->name()).second) continue;
+            modp->addStmtsp(impp->cloneTree(false));
+        }
     }
     void reconstruct(AstNodeModule* modp, AstVar* portp, AstIface* ifacep, AstModport* mpp) {
         FileLine* const fl = portp->fileline();
@@ -1505,6 +1507,7 @@ class HierIfaceForwardVisitor final {
             if (AstPort* const pp = VN_CAST(np, Port))
                 if (pp->name() == nm) portAstTailp = pp;
         AstPin* pinsp = nullptr;  // instance pins for the interface's own ports
+        AstNode* bridgesp = nullptr;  // flat-port <-> internal-member bridge assigns
         int pinnum = 0;
         for (AstNode* mnp = mpp->varsp(); mnp; mnp = mnp->nextp()) {
             const AstModportVarRef* const mvr = VN_CAST(mnp, ModportVarRef);
@@ -1525,15 +1528,30 @@ class HierIfaceForwardVisitor final {
             } else {
                 modp->addStmtsp(newPortp);
             }
-            // Interface's own port: connect it to the matching flat DPI port
-            AstPin* const pinp
-                = new AstPin{fl, ++pinnum, mvr->name(), new AstParseRef{fl, flatName}};
-            if (!pinsp) pinsp = pinp;
-            else pinsp->addNext(pinp);
+            if (memVarp->isIO()) {
+                // Interface's own port: connect it to the matching flat DPI port
+                AstPin* const pinp
+                    = new AstPin{fl, ++pinnum, mvr->name(), new AstParseRef{fl, flatName}};
+                if (!pinsp) pinsp = pinp;
+                else pinsp->addNext(pinp);
+            } else {
+                // Internal member: bridge it to the flat port with a continuous assign
+                AstNodeExpr* const memp = new AstDot{fl, false, new AstParseRef{fl, inst},
+                                                     new AstParseRef{fl, mvr->name()}};
+                AstNodeExpr* const flatp = new AstParseRef{fl, flatName};
+                AstAssignW* const asgp = mvr->direction().isNonOutput()
+                                             ? new AstAssignW{fl, memp, flatp}
+                                             : new AstAssignW{fl, flatp, memp};
+                // Wrap like the parser does: a bare AssignW is stranded unscoped by V3Inline
+                AstAlways* const alwp = new AstAlways{asgp};
+                if (!bridgesp) bridgesp = alwp;
+                else bridgesp->addNext(alwp);
+            }
         }
         // Raw interface instance; V3LinkCells resolves it (sets modp, __Viftop) so XMRs link
         AstCell* const cellp = new AstCell{fl, fl, inst, ifacep->name(), pinsp, nullptr, nullptr};
         modp->addStmtsp(cellp);
+        if (bridgesp) modp->addStmtsp(bridgesp);
         forwarded(modp, nm, inst);  // Re-point submodule pins to the rebuilt instance
         deletePort(modp, nm, portp);
     }
@@ -1557,13 +1575,7 @@ class HierIfaceForwardVisitor final {
             if (!ifacep) continue;
             AstModport* const mpp = findModport(ifacep, idt->modportName());
             if (!mpp) continue;
-            if (hasInternalMember(ifacep, mpp)) {
-                portp->v3warn(E_UNSUPPORTED,
-                              "Unsupported: hier_block interface port forwarded to a submodule "
-                              "with internal (non-port) members: "
-                                  << portp->prettyNameQ());
-                continue;
-            }
+            carryPackageImports(modp, ifacep);
             reconstruct(modp, portp, ifacep, mpp);
         }
     }
