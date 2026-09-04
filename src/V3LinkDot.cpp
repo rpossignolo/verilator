@@ -196,6 +196,12 @@ private:
     using ScopeAliasMap = std::unordered_map<VSymEnt*, VSymEnt*>;
     using IfaceModSyms = std::vector<std::pair<AstIface*, VSymEnt*>>;
 
+    // Module -> the hier_block it lives inside, for modules with no path from the top that
+    // avoids one. A reference between two such modules of the same block never crosses a
+    // partition boundary in the built design, so the boundary check must not reject it.
+    std::map<AstNodeModule*, AstNodeModule*> m_blockOwner;
+    AstNodeModule* m_refModp = nullptr;  // Module holding the reference being resolved
+
     static LinkDotState* s_errorThisp;  // Last self, for error reporting only
 
     // MEMBERS
@@ -786,6 +792,67 @@ private:
     }
 
 public:
+    void refModp(AstNodeModule* modp) { m_refModp = modp; }
+    // True if the reference being resolved sits inside blockp, so entering blockp stays
+    // within the block that will be verilated as one unit.
+    bool refWithinBlock(const AstNodeModule* blockp) const {
+        if (!m_refModp) return false;
+        if (m_refModp == blockp) return true;
+        const auto it = m_blockOwner.find(m_refModp);
+        return it != m_blockOwner.end() && it->second == blockp;
+    }
+    // hierBlock() is set in V3LinkResolve, after this pass, so read the pragma that both the
+    // source metacomment and the .vlt config leave behind (see V3Control::applyModule).
+    static bool isHierBlock(AstNodeModule* modp) {
+        if (modp->hierBlock()) return true;
+        bool found = false;
+        modp->foreach([&](AstPragma* pragmap) {
+            if (pragmap->pragType() == VPragmaType::HIER_BLOCK) found = true;
+        });
+        return found;
+    }
+    void computeBlockOwners(AstNetlist* netlistp) {
+        if (!v3Global.opt.hierarchical() || v3Global.opt.hierChild()) return;
+        AstNodeModule* const topp = netlistp->topModulep();
+        if (!topp) return;
+        std::set<AstNodeModule*> outside;  // Reachable without entering a hier_block
+        markReachable(topp, nullptr, outside, m_blockOwner);
+        // A module also reachable outside every block is shared, so it owns no block
+        for (auto it = m_blockOwner.begin(); it != m_blockOwner.end();) {
+            if (outside.count(it->first)) {
+                it = m_blockOwner.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+private:
+    // Walk instances from modp. While outside a block, record reachability; once inside one,
+    // record which block each module belongs to (nullptr owner = still outside).
+    static void markReachable(AstNodeModule* modp, AstNodeModule* ownerp,
+                              std::set<AstNodeModule*>& outside,
+                              std::map<AstNodeModule*, AstNodeModule*>& owner) {
+        if (!modp) return;
+        if (ownerp) {
+            const auto pair = owner.emplace(modp, ownerp);
+            if (!pair.second) {
+                if (pair.first->second != ownerp) pair.first->second = nullptr;  // Two blocks
+                return;
+            }
+        } else if (!outside.insert(modp).second) {
+            return;
+        }
+        modp->foreach([&](AstCell* cellp) {
+            AstNodeModule* const subp = cellp->modp();
+            if (!subp) return;
+            AstNodeModule* const subOwnerp
+                = ownerp ? ownerp : (isHierBlock(subp) ? subp : nullptr);
+            markReachable(subp, subOwnerp, outside, owner);
+        });
+    }
+
+public:
     VSymEnt* findDotted(FileLine* refLocationp, VSymEnt* lookupSymp, const string& dotname,
                         string& baddot, VSymEnt*& okSymp, bool firstId) {
         // Given a dotted hierarchy name, return where in scope it is
@@ -928,7 +995,8 @@ public:
             if (lookupSymp) {
                 if (const AstCell* const cellp = VN_CAST(lookupSymp->nodep(), Cell)) {
                     if (const AstNodeModule* const modp = cellp->modp()) {
-                        if (modp->hierBlock() && !leftname.empty()) {
+                        if (modp->hierBlock() && !leftname.empty()
+                            && !refWithinBlock(modp)) {
                             refLocationp->v3error("Cannot access scope inside hierarchical block");
                         } else if (VN_IS(modp, NotFoundModule)) {
                             refLocationp->v3error("Dotted reference to instance that refers to "
@@ -3830,8 +3898,10 @@ class LinkDotResolveVisitor final : public VNVisitor {
             = m_statep->getNodeSym(nodep);  // Until overridden by a SCOPE
         m_cellp = nullptr;
         m_modp = nodep;
+        m_statep->refModp(nodep);
         m_modportNum = 0;
         iterateChildren(nodep);
+        m_statep->refModp(nullptr);
         m_modp = nullptr;
         m_ds.m_dotSymp = m_curSymp = m_modSymp = nullptr;
         m_ds.m_dotPos = DP_NONE;
@@ -6427,6 +6497,7 @@ void V3LinkDot::linkDotGuts(AstNetlist* rootp, VLinkDotStep step) {
     VIsCached::clearCacheTree();  // Avoid using any stale isPure
     dumpSubstep("prelinkdot");
     LinkDotState state{rootp, step};
+    state.computeBlockOwners(rootp);
 
     { LinkDotFindVisitor{rootp, &state}; }
     dumpSubstep("prelinkdot-find");
