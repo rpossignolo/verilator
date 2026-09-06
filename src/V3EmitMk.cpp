@@ -823,6 +823,71 @@ public:
 class EmitMkHierVerilation final {
     const V3HierGraph* const m_graphp;
     const string m_makefile;  // path of this makefile
+    // Source file -> the one block that exclusively owns it, or "" when shared. A file is
+    // owned only if every module declared in it lives inside that block and nowhere else,
+    // so anything a second block or the top can reach stays a dependency of everything.
+    std::map<string, string> m_fileOwner;
+
+    // Modules reachable from modp without descending into a nested hier_block
+    static void collectModules(const AstNodeModule* modp, std::set<const AstNodeModule*>& out) {
+        if (!modp || !out.insert(modp).second) return;
+        const_cast<AstNodeModule*>(modp)->foreach([&](AstCell* cellp) {
+            const AstNodeModule* const subp = cellp->modp();
+            if (!subp || subp->hierBlock()) return;
+            collectModules(subp, out);
+        });
+    }
+    static string fileOf(const AstNodeModule* modp) {
+        return V3Os::filenameRealPath(modp->fileline()->filename());
+    }
+    void computeFileOwners() {
+        // Which modules each block owns, and which the top can reach on its own
+        std::map<const AstNodeModule*, string> modOwner;  // "" = shared
+        std::set<const AstNodeModule*> outside;
+        if (const AstNodeModule* const topp = v3Global.rootp()->topModulep()) {
+            collectModules(topp, outside);
+        }
+        for (const V3GraphVertex& vtx : m_graphp->vertices()) {
+            const V3HierBlock* const blockp = vtx.as<V3HierBlock>();
+            std::set<const AstNodeModule*> inside;
+            collectModules(blockp->modp(), inside);
+            for (const AstNodeModule* const modp : inside) {
+                if (outside.count(modp)) continue;  // Also reachable outside every block
+                const auto pair = modOwner.emplace(modp, blockp->hierPrefix());
+                if (!pair.second && pair.first->second != blockp->hierPrefix()) {
+                    pair.first->second = "";  // Wanted by two blocks
+                }
+            }
+        }
+        // Lift module ownership to whole files; a file with anything unowned in it is shared
+        std::map<string, string> owner;
+        std::set<string> shared;
+        for (AstNodeModule* modp = v3Global.rootp()->modulesp(); modp;
+             modp = VN_AS(modp->nextp(), NodeModule)) {
+            const string file = fileOf(modp);
+            const auto it = modOwner.find(modp);
+            const string own = it == modOwner.end() ? "" : it->second;
+            if (own.empty()) {
+                shared.insert(file);
+                continue;
+            }
+            const auto pair = owner.emplace(file, own);
+            if (!pair.second && pair.first->second != own) shared.insert(file);
+        }
+        for (const auto& i : owner)
+            if (!shared.count(i.first)) m_fileOwner.emplace(i.first, i.second);
+    }
+    // Files every Verilation must depend on: everything not owned by exactly one block
+    void emitInputFiles(V3OutMkFile& of, const string& var, const string& blockPrefix) const {
+        of.puts(var + " := \\\n");
+        for (const auto& i : v3Global.opt.vFiles()) {
+            const string file = V3Os::filenameRealPath(i.filename());
+            const auto it = m_fileOwner.find(file);
+            if (it != m_fileOwner.end() && it->second != blockPrefix) continue;
+            of.puts("  " + file + " \\\n");
+        }
+        of.puts("\n");
+    }
     void emitCommonOpts(V3OutMkFile& of) const {
         of.puts("# Verilation of hierarchical blocks are executed in this directory\n");
         of.puts("VM_HIER_RUN_DIR := " + V3Os::cwd() + "\n");
@@ -834,6 +899,15 @@ class EmitMkHierVerilation final {
         for (const auto& i : v3Global.opt.vFiles())
             of.puts("  " + V3Os::filenameRealPath(i.filename()) + " \\\n");
         of.puts("\n");
+        // Per-Verilation input lists, so an edit inside one block does not rebuild the rest
+        of.puts("# Files no single hierarchical block owns\n");
+        emitInputFiles(of, "VM_HIER_INPUT_FILES_SHARED", "");
+        for (const V3GraphVertex& vtx : m_graphp->vertices()) {
+            const V3HierBlock* const blockp = vtx.as<V3HierBlock>();
+            of.puts("# Shared files plus those only " + blockp->hierPrefix() + " uses\n");
+            emitInputFiles(of, "VM_HIER_INPUT_FILES_" + blockp->hierPrefix(),
+                           blockp->hierPrefix());
+        }
         of.puts("VM_HIER_VERILOG_LIBS := \\\n");
         for (const auto& i : v3Global.opt.libraryFiles()) {
             of.puts("  " + V3Os::filenameRealPath(i.filename()) + " \\\n");
@@ -884,11 +958,11 @@ class EmitMkHierVerilation final {
             const string argsFile = v3Global.hierGraphp()->topCommandArgsFilename(false);
             of.puts("\n# Verilate the top module\n");
             of.puts(v3Global.opt.prefix()
-                    + ".mk: $(VM_HIER_INPUT_FILES) $(VM_HIER_VERILOG_LIBS) ");
+                    + ".mk: $(VM_HIER_INPUT_FILES_SHARED) $(VM_HIER_VERILOG_LIBS) ");
             of.puts(V3Os::filenameNonDir(argsFile) + " ");
             for (const V3GraphVertex& vtx : m_graphp->vertices()) {
                 const V3HierBlock* const blockp = vtx.as<V3HierBlock>();
-                of.puts(blockp->hierWrapperFilename(true) + " ");
+                of.puts(blockp->hierWrapperFilename(true) + ".stamp ");
             }
             of.puts("\n");
             emitLaunchVerilator(of, argsFile);
@@ -901,11 +975,12 @@ class EmitMkHierVerilation final {
             const string prefix = blockp->hierPrefix();
             const string argsFilename = blockp->commandArgsFilename(false);
             of.puts(blockp->hierGeneratedFilenames(true));
-            of.puts(": $(VM_HIER_INPUT_FILES) $(VM_HIER_VERILOG_LIBS) ");
+            of.puts(": $(VM_HIER_INPUT_FILES_" + blockp->hierPrefix()
+                    + ") $(VM_HIER_VERILOG_LIBS) ");
             of.puts(V3Os::filenameNonDir(argsFilename) + " ");
             for (const V3GraphEdge& edge : blockp->outEdges()) {
                 const V3HierBlock* const dependencyp = edge.top()->as<V3HierBlock>();
-                of.puts(dependencyp->hierWrapperFilename(true) + " ");
+                of.puts(dependencyp->hierWrapperFilename(true) + ".stamp ");
             }
             of.puts("\n");
             emitLaunchVerilator(of, argsFilename);
@@ -923,6 +998,15 @@ class EmitMkHierVerilation final {
             of.puts("\n\t$(MAKE) -f " + blockp->hierMkFilename(false) + " -C " + prefix);
             of.puts(" VM_PREFIX=" + prefix);
             of.puts("\n\n");
+
+            // Boundary stamp. Re-Verilating a block always rewrites its wrapper, but the
+            // top only cares when the wrapper's contents change; keying the top off the
+            // file itself rebuilds it for every edit inside any block.
+            const string wrapper = blockp->hierWrapperFilename(true);
+            of.puts(wrapper + ".stamp: " + wrapper + "\n");
+            of.puts("\t@if cmp -s " + wrapper + " " + wrapper + ".prev 2>/dev/null; then :; \\\n");
+            of.puts("\t else cp -f " + wrapper + " " + wrapper + ".prev; touch $@; fi\n");
+            of.puts("\t@test -f $@ || touch $@\n\n");
         }
         of.puts("endif  # Guard\n");
     }
@@ -931,6 +1015,7 @@ public:
     explicit EmitMkHierVerilation(const V3HierGraph* graphp)
         : m_graphp{graphp}
         , m_makefile{v3Global.opt.makeDir() + "/" + v3Global.opt.prefix() + "_hier.mk"} {
+        computeFileOwners();
         V3OutMkFile of{m_makefile};
         emit(of);
     }
