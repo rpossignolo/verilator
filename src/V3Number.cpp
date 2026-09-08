@@ -1229,7 +1229,23 @@ bool V3Number::isAnyZ() const VL_MT_SAFE {
 }
 bool V3Number::isLtXZ(const V3Number& rhs) const {
     // Include X/Z in comparisons for sort ordering
-    for (int bit = 0; bit < std::max(width(), rhs.width()); ++bit) {
+    const int maxBits = std::max(width(), rhs.width());
+    int bit = 0;
+    // A word that is X/Z-free and bit-identical in both takes the per-bit loop's fall-through
+    // path for all 32 of its bits, so step over it whole. Only words fully inside both widths
+    // qualify, leaving the out-of-width extension rules to the per-bit code.
+    if (isNumber() && rhs.isNumber()) {
+        const int commonWords = std::min(width(), rhs.width()) / 32;
+        const ValueAndX* const lhsp = m_data.num();
+        const ValueAndX* const rhsp = rhs.m_data.num();
+        while (bit / 32 < commonWords) {
+            const ValueAndX l = lhsp[bit / 32];
+            const ValueAndX r = rhsp[bit / 32];
+            if ((l.m_valueX | r.m_valueX) != 0 || l.m_value != r.m_value) break;
+            bit += 32;
+        }
+    }
+    for (; bit < maxBits; ++bit) {
         if (bitIs1(bit) && rhs.bitIs0(bit)) return true;
         if (rhs.bitIs1(bit) && bitIs0(bit)) return false;
         if (bitIsXZ(bit)) return true;
