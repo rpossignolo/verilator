@@ -18,6 +18,8 @@
 
 #include "V3EmitCBase.h"
 
+#include <unordered_set>
+
 #include "V3Task.h"
 
 //######################################################################
@@ -284,9 +286,42 @@ void EmitCBaseVisitorConst::emitModCUse(const AstNodeModule* modp, VUseType useT
     if (nl) puts("\n");
 }
 
+// Which modules actually hold a `systemc section. The global hasSystemCSections() flag is
+// set by the std package Verilator itself supplies (verilated_std.sv has a
+// `systemc_header_post under VERILATOR_TIMING), so on any --timing build it stops gating
+// anything and every module pays the linear scan below, once per section type.
+namespace {
+struct ScSectionModules final {
+    std::unordered_set<const AstNodeModule*> m_known;  // Modules this covers
+    std::unordered_set<const AstNodeModule*> m_withSections;
+};
+const ScSectionModules& scSectionModules() {
+    static const ScSectionModules s_info = []() {
+        ScSectionModules info;
+        for (AstNodeModule* modp = v3Global.rootp()->modulesp(); modp;
+             modp = VN_AS(modp->nextp(), NodeModule)) {
+            info.m_known.insert(modp);
+            for (AstNode* nodep = modp->stmtsp(); nodep; nodep = nodep->nextp()) {
+                if (VN_IS(nodep, SystemCSection)) {
+                    info.m_withSections.insert(modp);
+                    break;
+                }
+            }
+        }
+        return info;
+    }();
+    return s_info;
+}
+}  // namespace
+
 std::pair<string, FileLine*> EmitCBaseVisitorConst::scSection(const AstNodeModule* modp,
                                                               VSystemCSectionType type) {
     if (!v3Global.hasSystemCSections()) return std::make_pair("", nullptr);
+    // A module known to hold none can skip the scan; anything unrecognised falls through
+    const ScSectionModules& info = scSectionModules();
+    if (info.m_known.count(modp) && !info.m_withSections.count(modp)) {
+        return std::make_pair("", nullptr);
+    }
     string text;
     FileLine* fl = nullptr;
     int last_line = -999;
