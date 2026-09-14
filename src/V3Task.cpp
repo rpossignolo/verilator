@@ -1021,6 +1021,13 @@ class TaskVisitor final : public VNVisitor {
             // Add argument to call
             AstVarScope* const outvscp = addFuncArg(portp);
             if (!portp->isNonOutput()) continue;
+            if (isDpiCompatStruct(portp)) {
+                AstCStmt* const cstmtp = new AstCStmt{portp->fileline()};
+                cstmtp->add(new AstVarRef{portp->fileline(), outvscp, VAccess::WRITE});
+                cstmtp->add(" = *" + portp->name() + ";");
+                funcp->addStmtsp(cstmtp);
+                continue;
+            }
             // Convert input/inout arguments to dpi type
             const std::string deref
                 = portp->isInout()  //
@@ -1040,7 +1047,13 @@ class TaskVisitor final : public VNVisitor {
         for (AstNode* stmtp = nodep->stmtsp(); stmtp; stmtp = stmtp->nextp()) {
             if (AstVar* const portp = VN_CAST(stmtp, Var)) {
                 if (portp->isIO() && portp->isWritable() && !portp->isFuncReturn()) {
-                    funcp->addStmtsp(createAssignInternalToDpi(portp, true, tmpSuffixp, ""));
+                    if (isDpiCompatStruct(portp)) {
+                        funcp->addStmtsp(new AstCStmt{portp->fileline(),
+                                                      "*" + portp->name() + " = " + portp->name()
+                                                          + tmpSuffixp + ";\n"});
+                    } else {
+                        funcp->addStmtsp(createAssignInternalToDpi(portp, true, tmpSuffixp, ""));
+                    }
                 }
             }
         }
@@ -1123,6 +1136,12 @@ class TaskVisitor final : public VNVisitor {
         }
     }
 
+    static bool isDpiCompatStruct(const AstVar* portp) {
+        const AstNodeUOrStructDType* const sdtypep
+            = VN_CAST(portp->dtypep()->skipRefp(), NodeUOrStructDType);
+        return sdtypep && sdtypep->isDpiCompat();
+    }
+
     static bool makePortList(AstNodeFTask* nodep, AstCFunc* dpip) {
         bool allOk = true;
         // Copy nodep's list of function I/O to the new dpip c function
@@ -1133,7 +1152,11 @@ class TaskVisitor final : public VNVisitor {
                     AstVar* const newPortp = portp->cloneTree(false);
                     newPortp->funcLocal(true);
                     dpip->addArgsp(newPortp);
-                    if (!portp->basicp()) {
+                    const AstNodeUOrStructDType* const sdtypep
+                        = VN_CAST(portp->dtypep()->skipRefp(), NodeUOrStructDType);
+                    if (sdtypep && sdtypep->isDpiCompat()) {
+                        // Passed as a pointer to the equivalent C struct
+                    } else if (!portp->basicp()) {
                         allOk = false;
                         portp->v3warn(
                             E_UNSUPPORTED,
@@ -1193,6 +1216,12 @@ class TaskVisitor final : public VNVisitor {
                                + name + " (&" + propName + ", &" + portp->name() + ");\n");
                         cfuncp->addStmtsp(new AstCStmt{portp->fileline(), varCode});
                         args += "&" + name;
+                    } else if (const AstNodeUOrStructDType* const sdtypep
+                                   = VN_CAST(portp->dtypep()->skipRefp(), NodeUOrStructDType);
+                               sdtypep && sdtypep->isDpiCompat()) {
+                        // The internal struct already has the C layout, so hand over
+                        // its address rather than copying through a temporary.
+                        args += "&" + portp->name();
                     } else {
                         if (portp->isWritable() && portp->basicp()->isDpiPrimitive()) {
                             if (!VN_IS(portp->dtypep()->skipRefp(), UnpackArrayDType)) args += "&";
@@ -1241,7 +1270,7 @@ class TaskVisitor final : public VNVisitor {
             if (AstVar* const portp = VN_CAST(stmtp, Var)) {
                 portp->protect(false);  // No additional exposure - already part of shown proto
                 if (portp->isIO() && (portp->isWritable() || portp->isFuncReturn())
-                    && !portp->isDpiOpenArray()) {
+                    && !portp->isDpiOpenArray() && !isDpiCompatStruct(portp)) {
                     AstVarScope* const portvscp = VN_AS(
                         portp->user2p(), VarScope);  // Remembered when we created it earlier
                     cfuncp->addStmtsp(

@@ -292,6 +292,8 @@ public:
     string name() const override VL_MT_STABLE { return m_name; }
     void name(const string& flag) override { m_name = flag; }
     bool packed() const VL_MT_SAFE { return m_packed; }
+    // True if this unpacked struct can cross a DPI boundary as a C struct
+    bool isDpiCompat() const;
     void packed(bool flag) { m_packed = flag; }
     // packed() but as don't support unpacked, presently all structs
     static bool packedUnsup() { return true; }

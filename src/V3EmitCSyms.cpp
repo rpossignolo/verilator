@@ -1601,6 +1601,26 @@ void EmitCSyms::emitDpiHdr() {
     puts("\n");
     puts("#include \"svdpi.h\"\n");
     puts("\n");
+    // Structs crossing DPI are defined in the model header; a forward
+    // declaration keeps this header usable from both C and C++ on its own.
+    {
+        std::set<std::string> declared;
+        for (const AstCFunc* const nodep : m_dpis) {
+            if (!nodep->dpiExportDispatcher() && !nodep->dpiImportPrototype()) continue;
+            for (AstNode* stmtp = nodep->argsp(); stmtp; stmtp = stmtp->nextp()) {
+                const AstVar* const portp = VN_CAST(stmtp, Var);
+                if (!portp) continue;
+                const AstNodeUOrStructDType* const sdtypep
+                    = VN_CAST(portp->dtypep()->skipRefp(), NodeUOrStructDType);
+                if (!sdtypep || !sdtypep->isDpiCompat()) continue;
+                const std::string name = EmitCUtil::prefixNameProtect(sdtypep);
+                if (!declared.insert(name).second) continue;
+                puts("typedef struct " + name + " " + name + ";\n");
+            }
+        }
+        if (!declared.empty()) puts("\n");
+    }
+
     puts("#ifdef __cplusplus\n");
     puts("extern \"C\" {\n");
     puts("#endif\n");

@@ -899,6 +899,29 @@ string AstVar::cPubArgType(bool named, bool forReturn) const {
     return arg;
 }
 
+bool AstNodeUOrStructDType::isDpiCompat() const {
+    // Verilator emits an unpacked struct as a C++ struct of the members' own C
+    // types, so it is already ABI-compatible with the C struct DPI expects.
+    if (packed()) return false;
+    if (!membersp()) return false;
+    for (const AstMemberDType* itemp = membersp(); itemp;
+         itemp = VN_AS(itemp->nextp(), MemberDType)) {
+        const AstNodeDType* subp = itemp->dtypep()->skipRefp();
+        // VlUnpacked holds only its C array, so an unpacked array member keeps
+        // the same layout as the equivalent C array.
+        while (const AstUnpackArrayDType* const arrayp = VN_CAST(subp, UnpackArrayDType)) {
+            subp = arrayp->subDTypep()->skipRefp();
+        }
+        const AstBasicDType* const basicp = VN_CAST(subp, BasicDType);
+        // Only fixed-width scalars keep the layouts identical; a bit/logic vector
+        // becomes svBitVecVal on the C side and would not match.
+        if (!basicp) return false;
+        if (!basicp->isDpiPrimitive()) return false;
+        if (basicp->isString() || basicp->isOpaque()) return false;
+    }
+    return true;
+}
+
 class dpiTypesToStringConverter VL_NOT_FINAL {
 public:
     virtual string openArray(const AstVar*) const { return "const svOpenArrayHandle"; }
@@ -912,9 +935,16 @@ public:
         type += keyword.dpiType();
         return type;
     }
+    virtual string unpackedStruct(const AstVar* varp) const {
+        return varp->dtypep()->skipRefp()->cType("", false, false);
+    }
     string convert(const AstVar* varp) const {
         if (varp->isDpiOpenArray()) {
             return openArray(varp);
+        } else if (const AstNodeUOrStructDType* const sdtypep
+                       = VN_CAST(varp->dtypep()->skipRefp(), NodeUOrStructDType);
+                   sdtypep && sdtypep->isDpiCompat()) {
+            return unpackedStruct(varp);
         } else if (const AstBasicDType* const basicp = varp->basicp()) {
             if (basicp->isDpiBitVec() || basicp->isDpiLogicVec()) {
                 return bitLogicVector(varp, basicp->isDpiBitVec());
@@ -944,6 +974,10 @@ string AstVar::dpiArgType(bool named, bool forReturn) const {
                     type += "*";
                 }
                 return type;
+            }
+            string unpackedStruct(const AstVar* varp) const override {
+                return string{varp->isWritable() ? "" : "const "}
+                       + dpiTypesToStringConverter::unpackedStruct(varp) + '*';
             }
         };
         string arg = converter{}.convert(this);
