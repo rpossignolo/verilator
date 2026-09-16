@@ -437,6 +437,9 @@ class DelayedVisitor final : public VNVisitor {
             if (vscpInfo.m_inSuspOrFork) return Scheme::FlagUnique;
             // Otherwise if an array of packed/basic elements, use the shared flag scheme
             if (basicp) return Scheme::FlagShared;
+            // ShadowVar copies the whole array back at block end, discarding any
+            // blocking write; commit per element instead when both are present.
+            if (checkMixedUsage(vscp, false)) return Scheme::FlagUnique;
             // Finally fall back on the shadow variable scheme, e.g. for
             // arrays of unpacked structs. This will be slow.
             // TODO: generic LHS scheme as discussed in #5092
@@ -990,13 +993,12 @@ class DelayedVisitor final : public VNVisitor {
     void recordWriteRef(AstVarRef* nodep, bool nonBlocking) {
         // Ignore references in certain contexts
         if (m_ignoreBlkAndNBlk) return;
-        // Ignore if it's an array
-        // TODO: we do this because it used to be the previous behaviour.
-        //       Is it still required, or should we warn for arrays as well?
-        //       Scheduling is no different for them...
-        //       Clarification: This is OK for arrays of primitive types, but
-        //       arrays that use the ShadowVar scheme don't work...
-        if (VN_IS(nodep->varScopep()->dtypep()->skipRefp(), UnpackArrayDType)) return;
+        // Arrays of primitives use flag/queue schemes that tolerate a blocking
+        // write; the ShadowVar scheme used for compound elements does not.
+        if (const AstUnpackArrayDType* const uaDTypep
+            = VN_CAST(nodep->varScopep()->dtypep()->skipRefp(), UnpackArrayDType)) {
+            if (uaDTypep->basicp()) return;
+        }
 
         m_writeRefs(nodep->varScopep()).emplace_back(nodep, nonBlocking, m_inNonCombLogic);
     }
