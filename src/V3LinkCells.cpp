@@ -584,7 +584,7 @@ class LinkCellsVisitor final : public VNVisitor {
     // A hier_block boundary interface port was flattened to plain member ports in the
     // block wrapper (see V3LinkParse); reconnect the parent's iface pin to those members.
     // Names are '<pin>_ifm_<member>' (scalar) or '<pin>_ifm<elem>_<member>' (iface array).
-    struct HierMember {
+    struct HierMember final {
         std::string portName;  // Full member-port name on the wrapper
         std::string member;  // Interface member name
         bool isArray = false;

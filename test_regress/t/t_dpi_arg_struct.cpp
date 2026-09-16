@@ -6,6 +6,7 @@
 // SPDX-FileCopyrightText: 2026 Wilson Snyder
 // SPDX-License-Identifier: LGPL-3.0-only OR Artistic-2.0
 
+#include <cinttypes>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -22,8 +23,8 @@ struct all_s {
 #define CHECK(got, exp) \
     do { \
         if ((got) != (exp)) { \
-            printf("%%Error: %s:%d: got=0x%llx exp=0x%llx\n", __FILE__, __LINE__, \
-                   (unsigned long long)(got), (unsigned long long)(exp)); \
+            printf("%%Error: %s:%d: got=0x%" PRIx64 " exp=0x%" PRIx64 "\n", __FILE__, \
+                   __LINE__, (uint64_t)(got), (uint64_t)(exp)); \
             abort(); \
         } \
     } while (0)
