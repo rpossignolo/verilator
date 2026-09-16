@@ -1,0 +1,5 @@
+%Error-UNSUPPORTED: t/t_hier_block_iface_fwd_arr_ports_bad.v:20:24: Unsupported: hier_block forwarded interface array port whose interface has ports: 'soc'
+   20 | module sub (chi_if.ccu soc[1:0]);
+      |                        ^~~
+                    ... For error description see https://verilator.org/warn/UNSUPPORTED?v=latest
+%Error: Exiting due to
