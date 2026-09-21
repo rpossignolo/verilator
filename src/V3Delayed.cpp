@@ -221,8 +221,11 @@ class DelayedVisitor final : public VNVisitor {
             if (!m_senTreep) m_senTreep = new AstSenTree{nodep->fileline(), nullptr};
             // Add a copy of each term
             m_senTreep->addSensesp(nodep->cloneTree(true));
-            // Remove duplicates
-            V3Const::constifyExpensiveEdit(m_senTreep);
+        }
+        // Deduplicating per addition re-folds the whole accumulated tree each time, which is
+        // superlinear when every write to one variable carries its own clock.
+        void finalizeSensitivity() {
+            if (m_senTreep) V3Const::constifyExpensiveEdit(m_senTreep);
         }
         // cppcheck-suppress constParameterPointer
         void addSensitivity(AstSenTree* nodep) { addSensitivity(nodep->sensesp()); }
@@ -1012,6 +1015,8 @@ class DelayedVisitor final : public VNVisitor {
     // VISITORS
     void visit(AstNetlist* nodep) override {
         iterateChildren(nodep);
+        // All NBAs are gathered, so sensitivities can be deduplicated once per variable now
+        for (AstVarScope* const vscp : m_vscps) m_vscpInfo(vscp).finalizeSensitivity();
         // Decide which scheme to use for each variable and do the 'prepare' step
         for (AstVarScope* const vscp : m_vscps) {
             VarScopeInfo& vscpInfo = m_vscpInfo(vscp);
