@@ -156,6 +156,7 @@ class DelayedVisitor final : public VNVisitor {
         bool m_inSuspOrFork = false;  // Used on LHS of NBA in suspendable process or fork
         Scheme m_scheme = Scheme::Undecided;  // Conversion scheme to use for this variable
         uint32_t m_nTmp = 0;  // Temporary number for unique names
+        uint32_t m_nNbas = 0;  // Number of NBAs targeting this variable
 
     private:
         // Combined sensitivities of all NBAs targeting this variable
@@ -438,6 +439,14 @@ class DelayedVisitor final : public VNVisitor {
             }
             // In a suspendable of fork, we must use the unique flag scheme, TODO: why?
             if (vscpInfo.m_inSuspOrFork) return Scheme::FlagUnique;
+            // The flag schemes cost two temporaries per NBA site, which is unaffordable
+            // when a whole array is written element-wise; one commit queue replaces them.
+            if (v3Global.opt.nbaQueueSites() > 0
+                && vscpInfo.m_nNbas >= static_cast<uint32_t>(v3Global.opt.nbaQueueSites())
+                && basicp
+                && (basicp->isIntegralOrPacked() || basicp->isDouble() || basicp->isString())) {
+                return vscpInfo.m_partial ? Scheme::ValueQueuePartial : Scheme::ValueQueueWhole;
+            }
             // Otherwise if an array of packed/basic elements, use the shared flag scheme
             if (basicp) return Scheme::FlagShared;
             // ShadowVar copies the whole array back at block end, discarding any
@@ -1295,6 +1304,7 @@ class DelayedVisitor final : public VNVisitor {
             m_vscps.emplace_back(vscp);
         }
         // Note usage context
+        ++vscpInfo.m_nNbas;
         vscpInfo.m_whole |= VN_IS(nodep->lhsp(), VarRef);
         vscpInfo.m_partial |= VN_IS(nodep->lhsp(), Sel);
         vscpInfo.m_inLoop |= m_inLoop;

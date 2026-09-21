@@ -1865,6 +1865,7 @@ void V3Options::parseOptsList(FileLine* fl, const string& optdir, int argc,
     DECL_OPTION("-no-unlimited-stack", CbCall, []() {});  // Processed only in bin/verilator shell
     DECL_OPTION("-constraint-array-limit", Set, &m_constraintArrayLimit);
     DECL_OPTION("-unroll-count", Set, &m_unrollCount).undocumented();  // Optimization tweak
+    DECL_OPTION("-nba-queue-sites", Set, &m_nbaQueueSites).undocumented();  // Optimization tweak
     DECL_OPTION("-unroll-limit", Set, &m_unrollLimit);
     DECL_OPTION("-unroll-stmts", Set, &m_unrollStmts).undocumented();  // Optimization tweak
     DECL_OPTION("-unused-regexp", Set, &m_unusedRegexp);

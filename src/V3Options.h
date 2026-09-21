@@ -355,6 +355,7 @@ private:
     int         m_traceMaxArray = 32;  // main switch: --trace-max-array
     int         m_traceMaxWidth = 4096; // main switch: --trace-max-width
     int         m_unrollCount = 64;  // main switch: --unroll-count
+    int         m_nbaQueueSites = 0;  // main switch: --nba-queue-sites
     int         m_unrollLimit = 16384;  // main switch: --unroll-limit
     int         m_unrollStmts = 30000;  // main switch: --unroll-stmts
     int         m_constraintArrayLimit = 64;  // main switch: --constraint-array-limit
@@ -664,6 +665,7 @@ public:
         return trace() && traceEnabledVcd() && (threads() > 1 || hierChild() > 1);
     }
     int unrollCount() const { return m_unrollCount; }
+    int nbaQueueSites() const { return m_nbaQueueSites; }
     int unrollLimit() const { return m_unrollLimit; }
     int unrollStmts() const { return m_unrollStmts; }
     int constraintArrayLimit() const { return m_constraintArrayLimit; }
