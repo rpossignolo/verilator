@@ -1059,6 +1059,32 @@ class GateDedupe final {
     size_t m_statDedupLogic = 0;  // Statistic tracking
     GateDedupeVarVisitor m_varVisitor;  // Looks for a dupe of the logic
     uint32_t m_depth = 0;  // Iteration depth
+    // Non-dedupable consumers are never re-read by this pass, so batch their replacements into
+    // one walk per consumer rather than one walk per eliminated var (e.g. huge trace CFuncs).
+    std::unordered_map<AstNode*, std::unordered_map<const AstVarScope*, AstNodeVarRef*>>
+        m_deferred;
+    std::vector<AstNode*> m_deferredOrder;  // m_deferred keys, in first-insertion order
+
+    static void replaceRef(AstNodeVarRef* refp, AstNodeVarRef* dupRefp) {
+        UASSERT_OBJ(refp->access().isReadOnly(), refp, "Can't replace a write ref");
+        AstNodeVarRef* const newp = dupRefp->cloneTreePure(false);
+        // A VARREF should point to the original as it's otherwise confusing to throw
+        // warnings that point to a PIN rather than where the pin is used.
+        newp->fileline(refp->fileline());
+        newp->access(VAccess::READ);
+        refp->replaceWith(newp);
+        VL_DO_DANGLING(refp->deleteTree(), refp);
+    }
+
+    void applyDeferred() {
+        for (AstNode* const consumerp : m_deferredOrder) {
+            const auto& subs = m_deferred.at(consumerp);
+            consumerp->foreach([&](AstNodeVarRef* refp) {
+                const auto it = subs.find(refp->varScopep());
+                if (it != subs.end()) replaceRef(refp, it->second);
+            });
+        }
+    }
 
     void visit(GateVarVertex* vVtxp) {
         // Break loops; before user2 set so hit this vertex later
@@ -1099,23 +1125,14 @@ class GateDedupe final {
             UINFO(9, "replace with " << dupRefp);
             if (lVtxp == consumerVtxp) {
                 UINFO(9, "skipping as self-recirculates");
+            } else if (!consumerVtxp->dedupable()) {
+                auto& subs = m_deferred[consumerp];
+                if (subs.empty()) m_deferredOrder.push_back(consumerp);
+                subs.emplace(vVtxp->varScp(), dupRefp);
             } else {
                 // Substitute consumer logic
                 consumerp->foreach([&](AstNodeVarRef* refp) {
-                    if (refp->varScopep() != vVtxp->varScp()) return;
-
-                    UASSERT_OBJ(refp->access().isReadOnly(), refp, "Can't replace a write ref");
-
-                    // The replacement
-                    AstNodeVarRef* const newp = dupRefp->cloneTreePure(false);
-                    // A VARREF should point to the original as it's otherwise confusing to throw
-                    // warnings that point to a PIN rather than where the pin is used.
-                    newp->fileline(refp->fileline());
-                    newp->access(VAccess::READ);
-
-                    // Replace the node
-                    refp->replaceWith(newp);
-                    VL_DO_DANGLING(refp->deleteTree(), refp);
+                    if (refp->varScopep() == vVtxp->varScp()) replaceRef(refp, dupRefp);
                 });
             }
             edgep->relinkFromp(dupVVtxp);
@@ -1160,6 +1177,7 @@ class GateDedupe final {
                 if (vVtxp->isTop() && vVtxp->varScp()->varp()->isWritable()) visit(vVtxp);
             }
         }
+        applyDeferred();
     }
 
     ~GateDedupe() { V3Stats::addStat("Optimizations, Gate sigs deduped", m_statDedupLogic); }
