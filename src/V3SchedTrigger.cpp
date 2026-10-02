@@ -23,6 +23,7 @@
 #include "V3Const.h"
 #include "V3EmitCBase.h"
 #include "V3EmitV.h"
+#include "V3Hasher.h"
 #include "V3Order.h"
 #include "V3Sched.h"
 #include "V3SenExprBuilder.h"
@@ -612,14 +613,21 @@ bool alwaysRecompute(const AstSenItem* senItemp) {
     return external || !hasRef;
 }
 
-// Orders one segment of triggers into groups: always-recomputed first, then by the scope of the
-// expression's first variable, so equal expressions (which share prev values) share a group
+// Orders one segment of triggers into groups: always-recomputed first, then by the hierarchical
+// name of the expression's first variable (module inlining leaves most in one AstScope)
 void layoutGroups(const std::vector<const AstSenItem*>& items,
                   std::vector<const AstSenItem*>& out, std::vector<TriggerKit::DirtyGroup>& groups) {
     constexpr uint32_t WORD_SIZE = TriggerKit::WORD_SIZE;
+    // Small groups skip precisely; the cap keeps each guarded block splittable into normal TUs
     constexpr size_t GROUP_MIN_ITEMS = 4 * WORD_SIZE;
+    constexpr size_t GROUP_MAX_ITEMS = 16 * WORD_SIZE;
+    struct Keyed final {
+        std::string m_name;  // Hierarchical name of the first variable read
+        uint32_t m_exprHash;  // Equal expressions share 'prev' values, so must stay together
+        const AstSenItem* m_itemp;
+    };
     std::vector<const AstSenItem*> always;
-    std::vector<std::pair<std::string, const AstSenItem*>> keyed;
+    std::vector<Keyed> keyed;
     for (const AstSenItem* const itemp : items) {
         if (alwaysRecompute(itemp)) {
             always.push_back(itemp);
@@ -629,10 +637,14 @@ void layoutGroups(const std::vector<const AstSenItem*>& items,
         itemp->sensp()->foreach([&](const AstVarRef* refp) {
             if (!firstp) firstp = refp;
         });
-        keyed.emplace_back(firstp->varScopep()->scopep()->name(), itemp);
+        const AstVarScope* const vscp = firstp->varScopep();
+        keyed.push_back({vscp->scopep()->name() + "." + vscp->varp()->name(),
+                         V3Hasher::uncachedHash(itemp->sensp()).value(), itemp});
     }
-    std::stable_sort(keyed.begin(), keyed.end(),
-                     [](const auto& a, const auto& b) { return a.first < b.first; });
+    std::stable_sort(keyed.begin(), keyed.end(), [](const Keyed& a, const Keyed& b) {
+        if (a.m_name != b.m_name) return a.m_name < b.m_name;
+        return a.m_exprHash < b.m_exprHash;
+    });
     const auto closeGroup = [&](size_t firstItem, bool isAlways) {
         out.resize(vlstd::roundUpToMultipleOf<WORD_SIZE>(out.size()), nullptr);
         const uint32_t firstWord = firstItem / WORD_SIZE;
@@ -642,11 +654,15 @@ void layoutGroups(const std::vector<const AstSenItem*>& items,
     const size_t base = out.size();
     out.insert(out.end(), always.begin(), always.end());
     closeGroup(base, true);
+    V3Stats::addStat("Scheduling, 'act' dirty trigger always-recomputed", always.size());
     size_t groupStart = out.size();
     for (size_t i = 0; i < keyed.size(); ++i) {
-        out.push_back(keyed[i].second);
-        const bool scopeEnds = i + 1 == keyed.size() || keyed[i + 1].first != keyed[i].first;
-        if (scopeEnds && out.size() - groupStart >= GROUP_MIN_ITEMS) {
+        out.push_back(keyed[i].m_itemp);
+        const bool last = i + 1 == keyed.size();
+        const bool nameEnds = last || keyed[i + 1].m_name != keyed[i].m_name;
+        const bool exprEnds = nameEnds || keyed[i + 1].m_exprHash != keyed[i].m_exprHash;
+        const size_t size = out.size() - groupStart;
+        if ((nameEnds && size >= GROUP_MIN_ITEMS) || (exprEnds && size >= GROUP_MAX_ITEMS)) {
             closeGroup(groupStart, false);
             groupStart = out.size();
         }
