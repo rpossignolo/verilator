@@ -1755,6 +1755,7 @@ void V3Options::parseOptsList(FileLine* fl, const string& optdir, int argc,
         m_outFormatOk = true;
         m_systemC = true;
     });
+    DECL_OPTION("-sched-dirty-triggers", OnOff, &m_schedDirtyTriggers);
     DECL_OPTION("-sched-zero-delay", OnOff, &m_schedZeroDelay);
     DECL_OPTION("-skip-identical", OnOff, &m_skipIdentical);
     DECL_OPTION("-stats", OnOff, &m_stats);

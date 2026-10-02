@@ -1202,7 +1202,10 @@ void schedule(AstNetlist* netlistp) {
         staticp->addStmtsp(loopp);
     }
 
-    // Step 16: Clean up
+    // Step 16: All logic is in functions now, so make writers mark their trigger groups dirty
+    trigKit.addDirtyMarks(netlistp);
+
+    // Step 17: Clean up
     netlistp->clearStlFirstIterationp();
 
     // Haven't split static initializer yet

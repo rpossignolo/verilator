@@ -340,6 +340,10 @@ public:
         return {resultp, firedAtInitialization};
     }
 
+    // Update statements built so far, so a caller can attribute them to the item that built them
+    size_t preUpdateCount() const { return m_results.m_preUpdates.size(); }
+    size_t postUpdateCount() const { return m_results.m_postUpdates.size(); }
+
     Results getResultsAndClearUpdates() {
         m_hasPreUpdate.clear();
         m_hasPostUpdate.clear();

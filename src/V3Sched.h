@@ -232,6 +232,12 @@ public:
     // Triggers are storead as an UnpackedArray with a fixed word size
     static constexpr uint32_t WORD_SIZE_LOG2 = 6;  // 64-bits / VL_QUADSIZE
     static constexpr uint32_t WORD_SIZE = 1 << WORD_SIZE_LOG2;
+    // A word-aligned run of sense triggers recomputed only once one of its inputs was written
+    struct DirtyGroup final {
+        uint32_t m_firstWord;
+        uint32_t m_nWords;
+        bool m_always;  // Inputs can change without a visible write, so always recomputed
+    };
 
 private:
     const std::string m_name;  // TriggerKit name
@@ -272,6 +278,11 @@ private:
     // The AstCFunc setting a trigger vector to all zeroes - create lazily
     mutable AstCFunc* m_clearp = nullptr;
 
+    // Per trigger group: its inputs may have changed since it was last computed
+    AstVarScope* m_dirtyVscp = nullptr;
+    // Trigger groups that read each variable, which writers of that variable mark dirty
+    std::unordered_map<const AstVarScope*, std::vector<uint32_t>> m_dirtyGroups;
+
     // The map from 'pre' input SenTree to trigger SenTree
     std::unordered_map<const AstSenTree*, AstSenTree*> m_mapPre;
     // The map from other input SenTree to trigger SenTree
@@ -283,6 +294,13 @@ private:
     AstCFunc* createClearFunc() const;
     AstCFunc* createOrIntoFunc(AstUnpackArrayDType* const oDtypep,
                                AstUnpackArrayDType* const iDtypep) const;
+
+    // Emit the trigger computation of 'fp' as dirty-guarded groups
+    void addDirtyGroups(AstCFunc* fp, AstCFunc* initFuncp, const std::vector<DirtyGroup>& groups,
+                        AstAssign* wordStmtsp, const std::vector<const AstSenItem*>& senItemps,
+                        const std::vector<std::array<size_t, 4>>& updateRanges,
+                        const std::vector<AstNodeStmt*>& preUpdates,
+                        const std::vector<AstNodeStmt*>& postUpdates);
 
     // Create an AstSenTree that is sensitive to the given trigger indices
     AstSenTree* newTriggerSenTree(AstVarScope* vscp, const std::vector<uint32_t>& indices) const;
@@ -327,6 +345,9 @@ public:
                              const ExtraTriggers& extraTriggers,  //
                              bool slow,  //
                              bool useAcc);
+
+    // Make every function writing a trigger group's input mark that group dirty
+    void addDirtyMarks(AstNetlist* netlistp) const;
 
     // ACCESSORS
     AstVarScope* vscp() const { return m_vscp; }

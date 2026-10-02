@@ -582,6 +582,97 @@ AstAssign* TriggerKit::createSenTrigVecAssignment(AstVarScope* const target,
     return trigStmtsp;
 }
 
+namespace {
+
+// Variables written by coroutines whose resumption points cannot all be instrumented
+std::unordered_set<const AstVarScope*> uninstrumentableWrites(AstNetlist* netlistp) {
+    std::unordered_set<const AstVarScope*> result;
+    netlistp->foreach([&](const AstCFunc* funcp) {
+        if (!funcp->isCoroutine()) return;
+        const bool opaque = funcp->exists(
+            [](const AstCAwait* awaitp) { return !VN_IS(awaitp->backp(), StmtExpr); });
+        if (!opaque) return;
+        funcp->foreach([&](const AstNodeVarRef* refp) {
+            if (refp->varScopep() && refp->access().isWriteOrRW()) result.insert(refp->varScopep());
+        });
+    });
+    return result;
+}
+
+// Whether a trigger must be recomputed every time: its value can change without any write the
+// dirty marks see (events, class state, calls, external writers)
+bool alwaysRecompute(const AstSenItem* senItemp,
+                     const std::unordered_set<const AstVarScope*>& unsafeVars) {
+    switch (senItemp->edgeType()) {
+    case VEdgeType::ET_TRUE:
+    case VEdgeType::ET_EVENT:
+    case VEdgeType::ET_INITIAL_NBA: return true;
+    default: break;
+    }
+    const AstNodeExpr* const senp = senItemp->sensp();
+    if (!senp) return true;
+    if (senp->exists([](const AstNode* nodep) {
+            return VN_IS(nodep, MemberSel) || VN_IS(nodep, CMethodHard) || VN_IS(nodep, CExpr)
+                   || VN_IS(nodep, NodeCCall) || VN_IS(nodep, NodeFTaskRef)
+                   || VN_IS(nodep, CAwait) || VN_IS(nodep, VarXRef);
+        })) {
+        return true;
+    }
+    bool hasRef = false;
+    const bool external = senp->exists([&](const AstVarRef* refp) {
+        hasRef = true;
+        const AstVar* const varp = refp->varp();
+        return varp->isPrimaryIO() || varp->isSigUserRWPublic() || varp->isWrittenByDpi()
+               || varp->isVirtIface() || varp->sensIfacep() || unsafeVars.count(refp->varScopep());
+    });
+    return external || !hasRef;
+}
+
+// Orders one segment of triggers into groups: always-recomputed first, then by the scope of the
+// expression's first variable, so equal expressions (which share prev values) share a group
+void layoutGroups(const std::vector<const AstSenItem*>& items,
+                  const std::unordered_set<const AstVarScope*>& unsafeVars, uint32_t wordBase,
+                  std::vector<const AstSenItem*>& out, std::vector<TriggerKit::DirtyGroup>& groups) {
+    constexpr uint32_t WORD_SIZE = TriggerKit::WORD_SIZE;
+    constexpr size_t GROUP_MIN_ITEMS = 4 * WORD_SIZE;
+    std::vector<const AstSenItem*> always;
+    std::vector<std::pair<std::string, const AstSenItem*>> keyed;
+    for (const AstSenItem* const itemp : items) {
+        if (alwaysRecompute(itemp, unsafeVars)) {
+            always.push_back(itemp);
+            continue;
+        }
+        const AstVarRef* firstp = nullptr;
+        itemp->sensp()->foreach([&](const AstVarRef* refp) {
+            if (!firstp) firstp = refp;
+        });
+        keyed.emplace_back(firstp->varScopep()->scopep()->name(), itemp);
+    }
+    std::stable_sort(keyed.begin(), keyed.end(),
+                     [](const auto& a, const auto& b) { return a.first < b.first; });
+    const auto closeGroup = [&](size_t firstItem, bool isAlways) {
+        out.resize(vlstd::roundUpToMultipleOf<WORD_SIZE>(out.size()), nullptr);
+        const uint32_t firstWord = wordBase + firstItem / WORD_SIZE;
+        const uint32_t nWords = wordBase + out.size() / WORD_SIZE - firstWord;
+        if (nWords) groups.push_back({firstWord, nWords, isAlways});
+    };
+    const size_t base = out.size();
+    out.insert(out.end(), always.begin(), always.end());
+    closeGroup(base, true);
+    size_t groupStart = out.size();
+    for (size_t i = 0; i < keyed.size(); ++i) {
+        out.push_back(keyed[i].second);
+        const bool scopeEnds = i + 1 == keyed.size() || keyed[i + 1].first != keyed[i].first;
+        if (scopeEnds && out.size() - groupStart >= GROUP_MIN_ITEMS) {
+            closeGroup(groupStart, false);
+            groupStart = out.size();
+        }
+    }
+    if (out.size() > groupStart) closeGroup(groupStart, false);
+}
+
+}  // namespace
+
 TriggerKit TriggerKit::create(AstNetlist* netlistp,  //
                               AstCFunc* const initFuncp,  //
                               SenExprBuilder& senExprBuilder,  //
@@ -635,7 +726,33 @@ TriggerKit TriggerKit::create(AstNetlist* netlistp,  //
     // Pad 'senItemps' to nSenseTriggers with nullptr
     senItemps.resize(nSenseTriggers);
     // Number of words sense triggers (inclued pre)
-    const uint32_t nSenseWords = nSenseTriggers / WORD_SIZE;
+    uint32_t nSenseWords = nSenseTriggers / WORD_SIZE;
+
+    // Recompute groups of 'act' triggers only when their inputs were written
+    const bool useDirty = v3Global.opt.schedDirtyTriggers() && name == "act" && !slow
+                          && !v3Global.opt.mtasks();
+    std::vector<TriggerKit::DirtyGroup> groups;
+    uint32_t nPreWordsUsed = nPreWords;
+    if (useDirty) {
+        const std::unordered_set<const AstVarScope*> unsafeVars
+            = uninstrumentableWrites(netlistp);
+        const std::vector<const AstSenItem*> preItems(senItemps.begin(),
+                                                      senItemps.begin() + nPreSenItems);
+        const std::vector<const AstSenItem*> senseItems(
+            senItemps.begin() + nPreTriggers, senItemps.begin() + nPreTriggers + nSenItems);
+        std::vector<const AstSenItem*> laid;
+        layoutGroups(preItems, unsafeVars, 0, laid, groups);
+        nPreWordsUsed = laid.size() / WORD_SIZE;
+        layoutGroups(senseItems, unsafeVars, nPreWordsUsed, laid, groups);
+        senItemps = std::move(laid);
+        nSenseWords = senItemps.size() / WORD_SIZE;
+        senItem2TrigIdx.clear();
+        for (size_t i = 0; i < senItemps.size(); ++i) {
+            if (senItemps[i]) senItem2TrigIdx.emplace(*senItemps[i], i);
+        }
+        V3Stats::addStat("Scheduling, '" + name + "' dirty trigger groups", groups.size());
+    }
+    const uint32_t nSenseTriggersUsed = nSenseWords * WORD_SIZE;
 
     // Allocate space for the extra triggers
     V3Stats::addStat("Scheduling, '" + name + "' extra triggers", extraTriggers.size());
@@ -644,7 +761,7 @@ TriggerKit TriggerKit::create(AstNetlist* netlistp,  //
     const uint32_t nExtraWords = nExtraTriggers / WORD_SIZE;
 
     // We can now construct the trigger kit - this constructs all items that will be kept
-    TriggerKit kit{name, slow, nSenseWords, nExtraWords, nPreWords, senItem2TrigIdx, useAcc};
+    TriggerKit kit{name, slow, nSenseWords, nExtraWords, nPreWordsUsed, senItem2TrigIdx, useAcc};
 
     // If there are no triggers we are done
     if (!kit.m_nVecWords) return kit;
@@ -696,7 +813,9 @@ TriggerKit TriggerKit::create(AstNetlist* netlistp,  //
     // Add sense trigger computation
     // List of trigger computation expressions
     std::vector<AstNodeExpr*> trigps;
-    trigps.reserve(nSenseTriggers);
+    trigps.reserve(nSenseTriggersUsed);
+    // Update statements each trigger built, as [begin, end) into the builder's results
+    std::vector<std::array<size_t, 4>> updateRanges(senItemps.size(), {0, 0, 0, 0});
     // Statements to exectue at initialization time to fire initial triggers
     AstNodeStmt* initialTrigsp = nullptr;
     for (size_t i = 0; i < senItemps.size(); ++i) {
@@ -709,8 +828,12 @@ TriggerKit TriggerKit::create(AstNetlist* netlistp,  //
         }
 
         // Create the trigger computation expression
+        const size_t preBegin = senExprBuilder.preUpdateCount();
+        const size_t postBegin = senExprBuilder.postUpdateCount();
         const auto& pair = senExprBuilder.build(senItemp);
         trigps.emplace_back(pair.first);
+        updateRanges[i] = {preBegin, senExprBuilder.preUpdateCount(), postBegin,
+                           senExprBuilder.postUpdateCount()};
 
         // Add initialization time trigger
         if (pair.second || v3Global.opt.xInitialEdge()) {
@@ -735,13 +858,13 @@ TriggerKit TriggerKit::create(AstNetlist* netlistp,  //
         desc = VString::replaceSubstr(desc, "\n", "\\n");
         addDebug(i, desc);
     }
-    UASSERT(trigps.size() == nSenseTriggers, "Inconsistent number of trigger expressions");
+    UASSERT(trigps.size() == nSenseTriggersUsed, "Inconsistent number of trigger expressions");
 
     AstAssign* const trigStmtsp = createSenTrigVecAssignment(kit.m_vscp, trigps);
 
     // Add a print for each of the extra triggers
     for (unsigned i = 0; i < extraTriggers.size(); ++i) {
-        addDebug(nSenseTriggers + i,
+        addDebug(nSenseTriggersUsed + i,
                  "Internal '" + name + "' trigger - " + extraTriggers.m_descriptions.at(i));
     }
 
@@ -784,9 +907,14 @@ TriggerKit TriggerKit::create(AstNetlist* netlistp,  //
             fp->addStmtsp(AstCStmt::profExecSectionPush(flp, "trigBase " + name));
         }
         // Trigger computation
-        for (AstNodeStmt* const nodep : senResults.m_preUpdates) fp->addStmtsp(nodep);
-        fp->addStmtsp(trigStmtsp);
-        for (AstNodeStmt* const nodep : senResults.m_postUpdates) fp->addStmtsp(nodep);
+        if (!useDirty) {
+            for (AstNodeStmt* const nodep : senResults.m_preUpdates) fp->addStmtsp(nodep);
+            fp->addStmtsp(trigStmtsp);
+            for (AstNodeStmt* const nodep : senResults.m_postUpdates) fp->addStmtsp(nodep);
+        } else {
+            kit.addDirtyGroups(fp, initFuncp, groups, trigStmtsp, senItemps, updateRanges,
+                               senResults.m_preUpdates, senResults.m_postUpdates);
+        }
         // Add the initialization time triggers
         if (initialTrigsp) {
             AstVarScope* const initVscp = scopep->createTemp("__V" + name + "DidInit", 1);
@@ -1119,6 +1247,162 @@ public:
 void beforeTrigVisitor(AstNetlist* netlistp, SenExprBuilder& senExprBuilder,
                        const TriggerKit& trigKit) {
     AwaitBeforeTrigVisitor{netlistp, senExprBuilder, trigKit};
+}
+
+
+void TriggerKit::addDirtyGroups(AstCFunc* fp, AstCFunc* initFuncp,
+                                const std::vector<DirtyGroup>& groups, AstAssign* wordStmtsp,
+                                const std::vector<const AstSenItem*>& senItemps,
+                                const std::vector<std::array<size_t, 4>>& updateRanges,
+                                const std::vector<AstNodeStmt*>& preUpdates,
+                                const std::vector<AstNodeStmt*>& postUpdates) {
+    AstNetlist* const netlistp = v3Global.rootp();
+    AstScope* const scopep = netlistp->topScopep()->scopep();
+    FileLine* const flp = scopep->fileline();
+    const auto wr = [flp](AstVarScope* vp) { return new AstVarRef{flp, vp, VAccess::WRITE}; };
+
+    AstNodeDType* const flagDTypep = netlistp->findBitDType(8, 8, VSigning::UNSIGNED);
+    AstRange* const rp = new AstRange{flp, static_cast<int>(groups.size() - 1), 0};
+    AstUnpackArrayDType* const dirtyDTypep = new AstUnpackArrayDType{flp, flagDTypep, rp};
+    netlistp->typeTablep()->addTypesp(dirtyDTypep);
+    m_dirtyVscp = scopep->createTemp("__V" + m_name + "TrigDirty", dirtyDTypep);
+    m_dirtyVscp->varp()->isInternal(true);
+    m_dirtyVscp->varp()->noReset(true);
+    const auto flagp = [&](size_t g, VAccess access) -> AstNodeExpr* {
+        return new AstArraySel{flp, new AstVarRef{flp, m_dirtyVscp, access},
+                               static_cast<int>(g)};
+    };
+    const auto setFlag = [&](size_t g, uint32_t value) {
+        return new AstAssign{flp, flagp(g, VAccess::WRITE),
+                             new AstConst{flp, AstConst::WidthedValue{}, 8, value}};
+    };
+    // Everything is dirty before the first evaluation
+    for (size_t g = 0; g < groups.size(); ++g) initFuncp->addStmtsp(setFlag(g, 1));
+
+    // Word assignments, by word index
+    std::vector<AstAssign*> words;
+    for (AstAssign *nodep = wordStmtsp, *nextp; nodep; nodep = nextp) {
+        nextp = VN_AS(nodep->nextp(), Assign);
+        if (nextp) nextp->unlinkFrBackWithNext();
+        words.push_back(nodep);
+    }
+    std::vector<size_t> groupOfWord(words.size(), 0);
+    for (size_t g = 0; g < groups.size(); ++g) {
+        for (uint32_t w = 0; w < groups[g].m_nWords; ++w) {
+            groupOfWord[groups[g].m_firstWord + w] = g;
+        }
+    }
+    // Update statements of the group whose trigger built them
+    std::vector<AstNodeStmt*> groupPre(groups.size(), nullptr);
+    std::vector<AstNodeStmt*> groupPost(groups.size(), nullptr);
+    for (size_t i = 0; i < updateRanges.size(); ++i) {
+        const size_t g = groupOfWord.at(i / WORD_SIZE);
+        const auto& range = updateRanges[i];
+        for (size_t j = range[0]; j < range[1]; ++j) {
+            groupPre[g] = AstNode::addNext(groupPre[g], preUpdates[j]);
+        }
+        for (size_t j = range[2]; j < range[3]; ++j) {
+            groupPost[g] = AstNode::addNext(groupPost[g], postUpdates[j]);
+        }
+    }
+    // Same order as without groups, all pre updates, all words, then all post updates, since
+    // groups over the same variables share 'prev' and 'curr' values
+    const auto addGuarded = [&](size_t g, AstNode* thensp, AstNode* elsesp) {
+        if (!thensp && !elsesp) return;
+        if (groups[g].m_always) {
+            if (thensp) fp->addStmtsp(thensp);
+            return;
+        }
+        AstIf* const ifp = new AstIf{flp, flagp(g, VAccess::READ)};
+        if (thensp) ifp->addThensp(thensp);
+        if (elsesp) ifp->addElsesp(elsesp);
+        fp->addStmtsp(ifp);
+    };
+    for (size_t g = 0; g < groups.size(); ++g) addGuarded(g, groupPre[g], nullptr);
+    for (size_t g = 0; g < groups.size(); ++g) {
+        AstNode* thensp = nullptr;
+        AstNode* elsesp = nullptr;
+        for (uint32_t w = 0; w < groups[g].m_nWords; ++w) {
+            const int index = static_cast<int>(groups[g].m_firstWord + w);
+            thensp = AstNode::addNext(thensp, words[index]);
+            AstNodeExpr* const lhsp = new AstArraySel{flp, wr(m_vscp), index};
+            AstConst* const zerop = new AstConst{flp, AstConst::WidthedValue{}, WORD_SIZE, 0};
+            elsesp = AstNode::addNext(elsesp, new AstAssign{flp, lhsp, zerop});
+        }
+        addGuarded(g, thensp, elsesp);
+    }
+    for (size_t g = 0; g < groups.size(); ++g) {
+        AstNode* const thensp = groups[g].m_always
+                                    ? groupPost[g]
+                                    : AstNode::addNext(groupPost[g], setFlag(g, 0));
+        addGuarded(g, thensp, nullptr);
+    }
+
+    // Which groups each variable feeds
+    for (size_t i = 0; i < senItemps.size(); ++i) {
+        if (!senItemps[i]) continue;
+        const uint32_t g = static_cast<uint32_t>(groupOfWord.at(i / WORD_SIZE));
+        if (groups[g].m_always) continue;
+        senItemps[i]->sensp()->foreach([&](const AstVarRef* refp) {
+            std::vector<uint32_t>& gs = m_dirtyGroups[refp->varScopep()];
+            if (gs.empty() || gs.back() != g) gs.push_back(g);
+        });
+    }
+    for (auto& pair : m_dirtyGroups) {
+        std::sort(pair.second.begin(), pair.second.end());
+        pair.second.erase(std::unique(pair.second.begin(), pair.second.end()), pair.second.end());
+    }
+}
+
+void TriggerKit::addDirtyMarks(AstNetlist* netlistp) const {
+    if (!m_dirtyVscp) return;
+    FileLine* const flp = m_dirtyVscp->fileline();
+    size_t nFuncs = 0;
+    size_t nMarks = 0;
+    netlistp->foreach([&](AstCFunc* funcp) {
+        if (funcp == m_compVecp) return;
+        std::vector<uint32_t> gs;
+        funcp->foreach([&](const AstNodeVarRef* refp) {
+            if (!refp->varScopep() || !refp->access().isWriteOrRW()) return;
+            const auto it = m_dirtyGroups.find(refp->varScopep());
+            if (it != m_dirtyGroups.end()) gs.insert(gs.end(), it->second.begin(), it->second.end());
+        });
+        if (gs.empty()) return;
+        std::sort(gs.begin(), gs.end());
+        gs.erase(std::unique(gs.begin(), gs.end()), gs.end());
+        const auto newMarks = [&]() {
+            AstNode* marksp = nullptr;
+            for (const uint32_t g : gs) {
+                AstNodeExpr* const lhsp = new AstArraySel{
+                    flp, new AstVarRef{flp, m_dirtyVscp, VAccess::WRITE}, static_cast<int>(g)};
+                marksp = AstNode::addNext(
+                    marksp, new AstAssign{flp, lhsp, new AstConst{flp, AstConst::WidthedValue{},
+                                                                  8, 1}});
+            }
+            nMarks += gs.size();
+            return marksp;
+        };
+        // A coroutine resumes past its entry, so also mark around each suspension point
+        std::vector<AstStmtExpr*> awaitStmts;
+        funcp->foreach([&](AstCAwait* awaitp) {
+            if (AstStmtExpr* const stmtp = VN_CAST(awaitp->backp(), StmtExpr)) {
+                awaitStmts.push_back(stmtp);
+            }
+        });
+        for (AstStmtExpr* const stmtp : awaitStmts) {
+            stmtp->addHereThisAsNext(newMarks());
+            stmtp->addNextHere(newMarks());
+        }
+        AstNode* const marksp = newMarks();
+        if (AstNode* const stmtsp = funcp->stmtsp()) {
+            stmtsp->addHereThisAsNext(marksp);
+        } else {
+            funcp->addStmtsp(marksp);
+        }
+        ++nFuncs;
+    });
+    V3Stats::addStat("Scheduling, '" + m_name + "' dirty trigger marking functions", nFuncs);
+    V3Stats::addStat("Scheduling, '" + m_name + "' dirty trigger marks", nMarks);
 }
 
 }  // namespace V3Sched
