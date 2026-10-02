@@ -563,6 +563,7 @@ detailed descriptions of these arguments.
     --runtime-debug             Enable model runtime debugging
     --savable                   Enable model save-restore
     --sc                        Create SystemC output
+    --sched-dirty-triggers      Recompute only triggers whose inputs changed
     --sched-zero-delay          Specify #0 delay support
     --no-skip-identical         Disable skipping identical output
     --stats                     Create statistics file

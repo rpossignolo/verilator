@@ -1721,6 +1721,18 @@ Summary:
 
    Specifies SystemC output mode; see also :vlopt:`--cc` option.
 
+.. option:: --sched-dirty-triggers
+
+   Recompute 'act' region sense triggers only for groups whose inputs may
+   have been written since they were last computed, instead of recomputing
+   every trigger on every iteration of the 'act' region. This can greatly
+   reduce scheduling overhead in large designs with many clocks or many
+   time steps that change few signals. Triggers whose inputs can change
+   without a write visible to Verilator (events, class objects, function
+   calls, primary inputs, public signals and signals written by DPI exports)
+   are still recomputed on every iteration. Ignored with :vlopt:`--threads`
+   greater than 1.
+
 .. option:: --sched-zero-delay
 
 .. option:: --no-sched-zero-delay
