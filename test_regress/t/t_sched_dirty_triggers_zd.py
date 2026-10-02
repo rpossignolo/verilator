@@ -18,6 +18,6 @@ test.compile(verilator_flags2=["--binary", "--stats", "--sched-zero-delay", "--s
 test.execute()
 
 test.file_grep(test.stats, r"Scheduling, 'act' pre triggers\s+([1-9]\d*)")
-test.file_grep(test.stats, r"Scheduling, 'act' dirty trigger marking functions\s+([1-9]\d*)")
+test.file_grep(test.stats, r"Scheduling, 'act' dirty trigger marking sites\s+([1-9]\d*)")
 
 test.passes()

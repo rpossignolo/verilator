@@ -41,6 +41,9 @@ module t;
       forever #7 fclk = ~fclk;
     join_none
 
+  bit aclk;
+  assign #4 aclk = ~aclk;
+
   sub u (.hclk());
   initial forever #3 t.u.hclk = ~t.u.hclk;
 
@@ -48,10 +51,12 @@ module t;
   int n_div = 0;
   int n_t = 0;
   int n_f = 0;
+  int n_a = 0;
   always @(posedge gclk) ++n_g;
   always @(posedge div) ++n_div;
   always @(posedge tclk) ++n_t;
   always @(posedge fclk) ++n_f;
+  always @(posedge aclk) ++n_a;
 
   initial begin
     #52 en = 1;
@@ -60,6 +65,7 @@ module t;
     `check(n_div, 10);
     `check(n_t, 10);
     `check(n_f, 14);
+    `check(n_a, 25);
     `check(u.n, 33);
     $write("*-* All Finished *-*\n");
     $finish;

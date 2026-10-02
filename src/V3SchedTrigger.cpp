@@ -584,25 +584,9 @@ AstAssign* TriggerKit::createSenTrigVecAssignment(AstVarScope* const target,
 
 namespace {
 
-// Variables written by coroutines whose resumption points cannot all be instrumented
-std::unordered_set<const AstVarScope*> uninstrumentableWrites(AstNetlist* netlistp) {
-    std::unordered_set<const AstVarScope*> result;
-    netlistp->foreach([&](const AstCFunc* funcp) {
-        if (!funcp->isCoroutine()) return;
-        const bool opaque = funcp->exists(
-            [](const AstCAwait* awaitp) { return !VN_IS(awaitp->backp(), StmtExpr); });
-        if (!opaque) return;
-        funcp->foreach([&](const AstNodeVarRef* refp) {
-            if (refp->varScopep() && refp->access().isWriteOrRW()) result.insert(refp->varScopep());
-        });
-    });
-    return result;
-}
-
 // Whether a trigger must be recomputed every time: its value can change without any write the
 // dirty marks see (events, class state, calls, external writers)
-bool alwaysRecompute(const AstSenItem* senItemp,
-                     const std::unordered_set<const AstVarScope*>& unsafeVars) {
+bool alwaysRecompute(const AstSenItem* senItemp) {
     switch (senItemp->edgeType()) {
     case VEdgeType::ET_TRUE:
     case VEdgeType::ET_EVENT:
@@ -623,7 +607,7 @@ bool alwaysRecompute(const AstSenItem* senItemp,
         hasRef = true;
         const AstVar* const varp = refp->varp();
         return varp->isPrimaryIO() || varp->isSigUserRWPublic() || varp->isWrittenByDpi()
-               || varp->isVirtIface() || varp->sensIfacep() || unsafeVars.count(refp->varScopep());
+               || varp->isVirtIface() || varp->sensIfacep();
     });
     return external || !hasRef;
 }
@@ -631,14 +615,13 @@ bool alwaysRecompute(const AstSenItem* senItemp,
 // Orders one segment of triggers into groups: always-recomputed first, then by the scope of the
 // expression's first variable, so equal expressions (which share prev values) share a group
 void layoutGroups(const std::vector<const AstSenItem*>& items,
-                  const std::unordered_set<const AstVarScope*>& unsafeVars,
                   std::vector<const AstSenItem*>& out, std::vector<TriggerKit::DirtyGroup>& groups) {
     constexpr uint32_t WORD_SIZE = TriggerKit::WORD_SIZE;
     constexpr size_t GROUP_MIN_ITEMS = 4 * WORD_SIZE;
     std::vector<const AstSenItem*> always;
     std::vector<std::pair<std::string, const AstSenItem*>> keyed;
     for (const AstSenItem* const itemp : items) {
-        if (alwaysRecompute(itemp, unsafeVars)) {
+        if (alwaysRecompute(itemp)) {
             always.push_back(itemp);
             continue;
         }
@@ -734,16 +717,14 @@ TriggerKit TriggerKit::create(AstNetlist* netlistp,  //
     std::vector<TriggerKit::DirtyGroup> groups;
     uint32_t nPreWordsUsed = nPreWords;
     if (useDirty) {
-        const std::unordered_set<const AstVarScope*> unsafeVars
-            = uninstrumentableWrites(netlistp);
         const std::vector<const AstSenItem*> preItems(senItemps.begin(),
                                                       senItemps.begin() + nPreSenItems);
         const std::vector<const AstSenItem*> senseItems(
             senItemps.begin() + nPreTriggers, senItemps.begin() + nPreTriggers + nSenItems);
         std::vector<const AstSenItem*> laid;
-        layoutGroups(preItems, unsafeVars, laid, groups);
+        layoutGroups(preItems, laid, groups);
         nPreWordsUsed = laid.size() / WORD_SIZE;
-        layoutGroups(senseItems, unsafeVars, laid, groups);
+        layoutGroups(senseItems, laid, groups);
         senItemps = std::move(laid);
         nSenseWords = senItemps.size() / WORD_SIZE;
         senItem2TrigIdx.clear();
@@ -1362,54 +1343,116 @@ void TriggerKit::addDirtyGroups(AstCFunc* fp, AstCFunc* initFuncp,
 void TriggerKit::addDirtyMarks(AstNetlist* netlistp) const {
     if (!m_dirtyVscp) return;
     FileLine* const flp = m_dirtyVscp->fileline();
-    size_t nFuncs = 0;
+    size_t nSites = 0;
     size_t nMarks = 0;
-    // Collected first, as inserting statements while the tree is being walked is not allowed
-    std::vector<AstCFunc*> funcps;
-    netlistp->foreach([&](AstCFunc* funcp) { funcps.push_back(funcp); });
-    for (AstCFunc* const funcp : funcps) {
-        if (funcp == m_compVecp) continue;
-        std::vector<uint32_t> gs;
-        funcp->foreach([&](const AstNodeVarRef* refp) {
+    const auto groupsWritten = [&](const AstNode* nodep, std::vector<uint32_t>& gs) {
+        nodep->foreach([&](const AstNodeVarRef* refp) {
             if (!refp->varScopep() || !refp->access().isWriteOrRW()) return;
             const auto it = m_dirtyGroups.find(refp->varScopep());
             if (it != m_dirtyGroups.end()) gs.insert(gs.end(), it->second.begin(), it->second.end());
         });
-        if (gs.empty()) continue;
+    };
+    const auto uniq = [](std::vector<uint32_t>& gs) {
         std::sort(gs.begin(), gs.end());
         gs.erase(std::unique(gs.begin(), gs.end()), gs.end());
-        const auto newMarks = [&]() {
-            AstNode* marksp = nullptr;
-            for (const uint32_t g : gs) {
-                AstNodeExpr* const lhsp = new AstArraySel{
-                    flp, new AstVarRef{flp, m_dirtyVscp, VAccess::WRITE}, static_cast<int>(g)};
-                marksp = AstNode::addNext(
-                    marksp, new AstAssign{flp, lhsp, new AstConst{flp, AstConst::WidthedValue{},
-                                                                  8, 1}});
-            }
-            nMarks += gs.size();
-            return marksp;
-        };
-        // A coroutine resumes past its entry, so also mark around each suspension point
-        std::vector<AstStmtExpr*> awaitStmts;
-        funcp->foreach([&](AstCAwait* awaitp) {
-            if (AstStmtExpr* const stmtp = VN_CAST(awaitp->backp(), StmtExpr)) {
-                awaitStmts.push_back(stmtp);
-            }
-        });
-        for (AstStmtExpr* const stmtp : awaitStmts) {
-            stmtp->addHereThisAsNext(newMarks());
-            stmtp->addNextHere(newMarks());
+    };
+    const auto newMarks = [&](const std::vector<uint32_t>& gs) {
+        AstNode* marksp = nullptr;
+        for (const uint32_t g : gs) {
+            AstNodeExpr* const lhsp = new AstArraySel{
+                flp, new AstVarRef{flp, m_dirtyVscp, VAccess::WRITE}, static_cast<int>(g)};
+            marksp = AstNode::addNext(
+                marksp, new AstAssign{flp, lhsp, new AstConst{flp, AstConst::WidthedValue{}, 8, 1}});
         }
-        AstNode* const marksp = newMarks();
+        nMarks += gs.size();
+        ++nSites;
+        return marksp;
+    };
+
+    // Collected first, as inserting statements while the tree is being walked is not allowed
+    std::vector<AstCFunc*> funcps;
+    netlistp->foreach([&](AstCFunc* funcp) { funcps.push_back(funcp); });
+
+    // Coroutine code only runs inside a scheduler resume, or when a coroutine is started, so
+    // what any coroutine writes is marked right after each of those
+    // Fork bodies count too: they only become coroutine functions after scheduling
+    std::vector<uint32_t> coroGroups;
+    for (const AstCFunc* const funcp : funcps) {
+        if (funcp->isCoroutine() || funcp->exists([](const AstCAwait*) { return true; })) {
+            groupsWritten(funcp, coroGroups);
+        } else {
+            funcp->foreach([&](const AstFork* forkp) { groupsWritten(forkp, coroGroups); });
+        }
+    }
+    uniq(coroGroups);
+    if (!coroGroups.empty()) {
+        std::vector<AstNode*> sitesp;
+        for (AstCFunc* const funcp : funcps) {
+            funcp->foreach([&](AstNode* nodep) {
+                bool resumes = false;
+                if (const AstCMethodHard* const methodp = VN_CAST(nodep, CMethodHard)) {
+                    resumes = methodp->method() == VCMethod::SCHED_RESUME
+                              || methodp->method() == VCMethod::SCHED_RESUME_ZERO_DELAY
+                              || methodp->method() == VCMethod::FORK_DONE;
+                } else if (const AstNodeCCall* const callp = VN_CAST(nodep, NodeCCall)) {
+                    resumes = callp->funcp()->isCoroutine() && !VN_IS(callp->backp(), CAwait);
+                }
+                if (!resumes) return;
+                AstNode* stmtp = nodep;
+                while (stmtp && !VN_IS(stmtp, NodeStmt)) stmtp = stmtp->abovep();
+                UASSERT_OBJ(stmtp, nodep, "Resumption outside of a statement");
+                sitesp.push_back(stmtp);
+            });
+        }
+        std::sort(sitesp.begin(), sitesp.end());
+        sitesp.erase(std::unique(sitesp.begin(), sitesp.end()), sitesp.end());
+        for (AstNode* const stmtp : sitesp) stmtp->addNextHere(newMarks(coroGroups));
+    }
+
+    // Functions that (transitively) compute the triggers
+    std::unordered_set<const AstCFunc*> computes{m_compVecp};
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (const AstCFunc* const funcp : funcps) {
+            if (computes.count(funcp)) continue;
+            if (funcp->exists([&](const AstNodeCCall* callp) {
+                    return computes.count(callp->funcp()) > 0;
+                })) {
+                computes.insert(funcp);
+                changed = true;
+            }
+        }
+    }
+
+    // Other functions mark what they write on entry, and again after any trigger computation
+    // they reach, since a computation in between clears the flags
+    for (AstCFunc* const funcp : funcps) {
+        if (funcp == m_compVecp || funcp->isCoroutine()) continue;
+        std::vector<uint32_t> gs;
+        groupsWritten(funcp, gs);
+        if (gs.empty()) continue;
+        uniq(gs);
+        if (computes.count(funcp)) {
+            std::vector<AstNode*> sitesp;
+            funcp->foreach([&](AstNodeCCall* callp) {
+                if (!computes.count(callp->funcp())) return;
+                AstNode* stmtp = callp;
+                while (stmtp && !VN_IS(stmtp, NodeStmt)) stmtp = stmtp->abovep();
+                UASSERT_OBJ(stmtp, callp, "Call outside of a statement");
+                sitesp.push_back(stmtp);
+            });
+            std::sort(sitesp.begin(), sitesp.end());
+            sitesp.erase(std::unique(sitesp.begin(), sitesp.end()), sitesp.end());
+            for (AstNode* const stmtp : sitesp) stmtp->addNextHere(newMarks(gs));
+        }
+        AstNode* const marksp = newMarks(gs);
         if (AstNode* const stmtsp = funcp->stmtsp()) {
             stmtsp->addHereThisAsNext(marksp);
         } else {
             funcp->addStmtsp(marksp);
         }
-        ++nFuncs;
     }
-    V3Stats::addStat("Scheduling, '" + m_name + "' dirty trigger marking functions", nFuncs);
+    V3Stats::addStat("Scheduling, '" + m_name + "' dirty trigger marking sites", nSites);
     V3Stats::addStat("Scheduling, '" + m_name + "' dirty trigger marks", nMarks);
 }
 

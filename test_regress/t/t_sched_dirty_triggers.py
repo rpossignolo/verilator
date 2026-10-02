@@ -15,6 +15,6 @@ test.compile(verilator_flags2=["--binary", "--stats", "--sched-dirty-triggers"])
 
 test.execute()
 
-test.file_grep(test.stats, r"Scheduling, 'act' dirty trigger marking functions\s+([1-9]\d*)")
+test.file_grep(test.stats, r"Scheduling, 'act' dirty trigger marking sites\s+([1-9]\d*)")
 
 test.passes()
