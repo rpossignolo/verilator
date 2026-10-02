@@ -1361,9 +1361,11 @@ void TriggerKit::addDirtyMarks(AstNetlist* netlistp) const {
     FileLine* const flp = m_dirtyVscp->fileline();
     size_t nSites = 0;
     size_t nMarks = 0;
+    // AstNodeVarRef::user1() -> bool: write already marked by its own value check
+    const VNUser1InUse user1InUse;
     const auto groupsWritten = [&](const AstNode* nodep, std::vector<uint32_t>& gs) {
         nodep->foreach([&](const AstNodeVarRef* refp) {
-            if (!refp->varScopep() || !refp->access().isWriteOrRW()) return;
+            if (!refp->varScopep() || !refp->access().isWriteOrRW() || refp->user1()) return;
             const auto it = m_dirtyGroups.find(refp->varScopep());
             if (it != m_dirtyGroups.end()) gs.insert(gs.end(), it->second.begin(), it->second.end());
         });
@@ -1437,6 +1439,45 @@ void TriggerKit::addDirtyMarks(AstNetlist* netlistp) const {
                 computes.insert(funcp);
                 changed = true;
             }
+        }
+    }
+
+    // Whole-variable scalar writes mark only when the value changes: latches and combinational
+    // logic rewrite equal values every time they run, which would keep their groups always dirty
+    std::map<const AstNodeDType*, AstVarScope*> oldTemps;
+    AstScope* const topScopep = netlistp->topScopep()->scopep();
+    for (AstCFunc* const funcp : funcps) {
+        if (funcp == m_compVecp || funcp->isCoroutine() || computes.count(funcp)) continue;
+        std::vector<AstNodeAssign*> assignps;
+        funcp->foreach([&](AstNodeAssign* assignp) {
+            if (!VN_IS(assignp, Assign) && !VN_IS(assignp, AssignW)) return;
+            const AstVarRef* const refp = VN_CAST(assignp->lhsp(), VarRef);
+            if (!refp || !m_dirtyGroups.count(refp->varScopep())) return;
+            const AstBasicDType* const basicp = VN_CAST(refp->dtypep()->skipRefp(), BasicDType);
+            if (!basicp || !basicp->isIntegralOrPacked() || basicp->width() > 64) return;
+            assignps.push_back(assignp);
+        });
+        for (AstNodeAssign* const assignp : assignps) {
+            AstVarRef* const refp = VN_AS(assignp->lhsp(), VarRef);
+            AstVarScope* const vscp = refp->varScopep();
+            AstNodeDType* const dtypep = refp->dtypep();
+            AstVarScope*& oldp = oldTemps[dtypep];
+            if (!oldp) {
+                oldp = topScopep->createTemp("__V" + m_name + "TrigDirtyOld"
+                                                 + std::to_string(oldTemps.size()),
+                                             dtypep);
+                oldp->varp()->isInternal(true);
+                oldp->varp()->noReset(true);
+            }
+            FileLine* const aflp = assignp->fileline();
+            assignp->addHereThisAsNext(
+                new AstAssign{aflp, new AstVarRef{aflp, oldp, VAccess::WRITE},
+                              new AstVarRef{aflp, vscp, VAccess::READ}});
+            AstNodeExpr* const condp = new AstNeq{aflp, new AstVarRef{aflp, oldp, VAccess::READ},
+                                                  new AstVarRef{aflp, vscp, VAccess::READ}};
+            condp->dtypeSetBit();
+            assignp->addNextHere(new AstIf{aflp, condp, newMarks(m_dirtyGroups.at(vscp))});
+            refp->user1(true);
         }
     }
 
