@@ -631,7 +631,7 @@ bool alwaysRecompute(const AstSenItem* senItemp,
 // Orders one segment of triggers into groups: always-recomputed first, then by the scope of the
 // expression's first variable, so equal expressions (which share prev values) share a group
 void layoutGroups(const std::vector<const AstSenItem*>& items,
-                  const std::unordered_set<const AstVarScope*>& unsafeVars, uint32_t wordBase,
+                  const std::unordered_set<const AstVarScope*>& unsafeVars,
                   std::vector<const AstSenItem*>& out, std::vector<TriggerKit::DirtyGroup>& groups) {
     constexpr uint32_t WORD_SIZE = TriggerKit::WORD_SIZE;
     constexpr size_t GROUP_MIN_ITEMS = 4 * WORD_SIZE;
@@ -652,8 +652,8 @@ void layoutGroups(const std::vector<const AstSenItem*>& items,
                      [](const auto& a, const auto& b) { return a.first < b.first; });
     const auto closeGroup = [&](size_t firstItem, bool isAlways) {
         out.resize(vlstd::roundUpToMultipleOf<WORD_SIZE>(out.size()), nullptr);
-        const uint32_t firstWord = wordBase + firstItem / WORD_SIZE;
-        const uint32_t nWords = wordBase + out.size() / WORD_SIZE - firstWord;
+        const uint32_t firstWord = firstItem / WORD_SIZE;
+        const uint32_t nWords = out.size() / WORD_SIZE - firstWord;
         if (nWords) groups.push_back({firstWord, nWords, isAlways});
     };
     const size_t base = out.size();
@@ -741,9 +741,9 @@ TriggerKit TriggerKit::create(AstNetlist* netlistp,  //
         const std::vector<const AstSenItem*> senseItems(
             senItemps.begin() + nPreTriggers, senItemps.begin() + nPreTriggers + nSenItems);
         std::vector<const AstSenItem*> laid;
-        layoutGroups(preItems, unsafeVars, 0, laid, groups);
+        layoutGroups(preItems, unsafeVars, laid, groups);
         nPreWordsUsed = laid.size() / WORD_SIZE;
-        layoutGroups(senseItems, unsafeVars, nPreWordsUsed, laid, groups);
+        layoutGroups(senseItems, unsafeVars, laid, groups);
         senItemps = std::move(laid);
         nSenseWords = senItemps.size() / WORD_SIZE;
         senItem2TrigIdx.clear();
@@ -1287,11 +1287,16 @@ void TriggerKit::addDirtyGroups(AstCFunc* fp, AstCFunc* initFuncp,
         words.push_back(nodep);
     }
     std::vector<size_t> groupOfWord(words.size(), 0);
+    uint32_t nextWord = 0;
     for (size_t g = 0; g < groups.size(); ++g) {
+        UASSERT(groups[g].m_firstWord == nextWord && groups[g].m_nWords > 0,
+                "Trigger groups must tile the trigger words in order");
+        nextWord += groups[g].m_nWords;
         for (uint32_t w = 0; w < groups[g].m_nWords; ++w) {
-            groupOfWord[groups[g].m_firstWord + w] = g;
+            groupOfWord.at(groups[g].m_firstWord + w) = g;
         }
     }
+    UASSERT(nextWord == words.size(), "Trigger groups must cover every trigger word");
     // Update statements of the group whose trigger built them
     std::vector<AstNodeStmt*> groupPre(groups.size(), nullptr);
     std::vector<AstNodeStmt*> groupPost(groups.size(), nullptr);
@@ -1359,15 +1364,18 @@ void TriggerKit::addDirtyMarks(AstNetlist* netlistp) const {
     FileLine* const flp = m_dirtyVscp->fileline();
     size_t nFuncs = 0;
     size_t nMarks = 0;
-    netlistp->foreach([&](AstCFunc* funcp) {
-        if (funcp == m_compVecp) return;
+    // Collected first, as inserting statements while the tree is being walked is not allowed
+    std::vector<AstCFunc*> funcps;
+    netlistp->foreach([&](AstCFunc* funcp) { funcps.push_back(funcp); });
+    for (AstCFunc* const funcp : funcps) {
+        if (funcp == m_compVecp) continue;
         std::vector<uint32_t> gs;
         funcp->foreach([&](const AstNodeVarRef* refp) {
             if (!refp->varScopep() || !refp->access().isWriteOrRW()) return;
             const auto it = m_dirtyGroups.find(refp->varScopep());
             if (it != m_dirtyGroups.end()) gs.insert(gs.end(), it->second.begin(), it->second.end());
         });
-        if (gs.empty()) return;
+        if (gs.empty()) continue;
         std::sort(gs.begin(), gs.end());
         gs.erase(std::unique(gs.begin(), gs.end()), gs.end());
         const auto newMarks = [&]() {
@@ -1400,7 +1408,7 @@ void TriggerKit::addDirtyMarks(AstNetlist* netlistp) const {
             funcp->addStmtsp(marksp);
         }
         ++nFuncs;
-    });
+    }
     V3Stats::addStat("Scheduling, '" + m_name + "' dirty trigger marking functions", nFuncs);
     V3Stats::addStat("Scheduling, '" + m_name + "' dirty trigger marks", nMarks);
 }
