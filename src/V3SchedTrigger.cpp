@@ -1420,18 +1420,46 @@ void TriggerKit::addDirtyMarks(AstNetlist* netlistp) const {
     for (AstCFunc* const funcp : funcps) {
         if (funcp == m_compVecp || funcp->isCoroutine() || computes.count(funcp)) continue;
         std::vector<AstNodeAssign*> assignps;
+        // The written variable under element, word and bit selects with side-effect free indices
+        const auto baseRef = [](AstNodeExpr* lhsp) -> AstVarRef* {
+            while (true) {
+                if (AstArraySel* const selp = VN_CAST(lhsp, ArraySel)) {
+                    lhsp = selp->fromp();
+                } else if (AstWordSel* const selp = VN_CAST(lhsp, WordSel)) {
+                    lhsp = selp->fromp();
+                } else if (AstSel* const selp = VN_CAST(lhsp, Sel)) {
+                    lhsp = selp->fromp();
+                } else {
+                    return VN_CAST(lhsp, VarRef);
+                }
+            }
+        };
         funcp->foreach([&](AstNodeAssign* assignp) {
             if (!VN_IS(assignp, Assign) && !VN_IS(assignp, AssignW)) return;
-            const AstVarRef* const refp = VN_CAST(assignp->lhsp(), VarRef);
+            const AstVarRef* const refp = baseRef(assignp->lhsp());
             if (!refp || !m_dirtyGroups.count(refp->varScopep())) return;
-            const AstBasicDType* const basicp = VN_CAST(refp->dtypep()->skipRefp(), BasicDType);
+            // The written part is re-read after the write, so its indices must not change by it
+            if (!assignp->lhsp()->isPure() || !assignp->rhsp()->isPure()) return;
+            size_t nRefs = 0;
+            assignp->lhsp()->foreach([&](const AstNodeVarRef* vrefp) {
+                if (vrefp->varScopep() == refp->varScopep()) ++nRefs;
+            });
+            if (nRefs != 1) return;
+            const AstBasicDType* const basicp
+                = VN_CAST(assignp->lhsp()->dtypep()->skipRefp(), BasicDType);
             if (!basicp || !basicp->isIntegralOrPacked() || basicp->width() > 64) return;
             assignps.push_back(assignp);
         });
         for (AstNodeAssign* const assignp : assignps) {
-            AstVarRef* const refp = VN_AS(assignp->lhsp(), VarRef);
+            AstVarRef* const refp = baseRef(assignp->lhsp());
             AstVarScope* const vscp = refp->varScopep();
-            AstNodeDType* const dtypep = refp->dtypep();
+            AstNodeDType* const dtypep = assignp->lhsp()->dtypep();
+            // The written part, read back before and after the write
+            const auto readLhs = [&]() {
+                AstNodeExpr* const rdp = assignp->lhsp()->cloneTreePure(false);
+                rdp->foreach([](AstNodeVarRef* vrefp) { vrefp->access(VAccess::READ); });
+                return rdp;
+            };
             AstVarScope*& oldp = oldTemps[dtypep];
             if (!oldp) {
                 oldp = topScopep->createTemp("__V" + m_name + "TrigDirtyOld"
@@ -1442,10 +1470,9 @@ void TriggerKit::addDirtyMarks(AstNetlist* netlistp) const {
             }
             FileLine* const aflp = assignp->fileline();
             assignp->addHereThisAsNext(
-                new AstAssign{aflp, new AstVarRef{aflp, oldp, VAccess::WRITE},
-                              new AstVarRef{aflp, vscp, VAccess::READ}});
-            AstNodeExpr* const condp = new AstNeq{aflp, new AstVarRef{aflp, oldp, VAccess::READ},
-                                                  new AstVarRef{aflp, vscp, VAccess::READ}};
+                new AstAssign{aflp, new AstVarRef{aflp, oldp, VAccess::WRITE}, readLhs()});
+            AstNodeExpr* const condp
+                = new AstNeq{aflp, new AstVarRef{aflp, oldp, VAccess::READ}, readLhs()};
             condp->dtypeSetBit();
             assignp->addNextHere(new AstIf{aflp, condp, newMarks(m_dirtyGroups.at(vscp))});
             refp->user1(true);
