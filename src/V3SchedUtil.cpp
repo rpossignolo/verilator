@@ -28,6 +28,8 @@
 #include "V3SenExprBuilder.h"
 #include "V3Stats.h"
 
+#include <algorithm>
+
 VL_DEFINE_DEBUG_FUNCTIONS;
 
 namespace V3Sched {
@@ -257,6 +259,85 @@ AstIf* createIfFromSenTree(AstSenTree* senTreep) {
     }
     // Create the if statement conditional on the triggers
     return new AstIf{senTreep->fileline(), senEqnp};
+}
+
+AstNodeStmt* addTriggerWordSkips(AstNodeStmt* stmtsp) {
+    // A run is wrapped while its words stay few, so the outer test stays cheaper than the guards
+    constexpr size_t MAX_WORDS = 16;
+    constexpr size_t MAX_STMTS = 64;
+    struct Word final {
+        AstVarScope* m_vscp;
+        uint32_t m_index;
+        bool operator==(const Word& other) const {
+            return m_vscp == other.m_vscp && m_index == other.m_index;
+        }
+    };
+    // Adds the trigger words an AstIf condition reads, if it only tests trigger bits
+    const auto addWords = [](const AstNode* stmtp, std::vector<Word>& words) {
+        const AstIf* const ifp = VN_CAST(stmtp, If);
+        if (!ifp) return false;
+        bool pure = true;
+        bool any = false;
+        ifp->condp()->foreach([&](const AstNode* nodep) {
+            if (!pure) return;
+            if (const AstArraySel* const selp = VN_CAST(nodep, ArraySel)) {
+                const AstVarRef* const refp = VN_CAST(selp->fromp(), VarRef);
+                const AstConst* const idxp = VN_CAST(selp->bitp(), Const);
+                if (!refp || !idxp) {
+                    pure = false;
+                    return;
+                }
+                any = true;
+                const Word word{refp->varScopep(), idxp->toUInt()};
+                if (std::find(words.begin(), words.end(), word) == words.end()) {
+                    words.push_back(word);
+                }
+            } else if (!VN_IS(nodep, And) && !VN_IS(nodep, Or) && !VN_IS(nodep, Const)
+                       && !VN_IS(nodep, VarRef)) {
+                pure = false;
+            }
+        });
+        return pure && any;
+    };
+    std::vector<AstNodeStmt*> stmts;
+    for (AstNodeStmt *nodep = stmtsp, *nextp; nodep; nodep = nextp) {
+        nextp = VN_AS(nodep->nextp(), NodeStmt);
+        if (nextp) nextp->unlinkFrBackWithNext();
+        stmts.push_back(nodep);
+    }
+    AstNodeStmt* resultp = nullptr;
+    size_t i = 0;
+    while (i < stmts.size()) {
+        std::vector<Word> runWords;
+        size_t j = i;
+        while (j < stmts.size() && j - i < MAX_STMTS) {
+            std::vector<Word> words = runWords;
+            if (!addWords(stmts[j], words) || words.size() > MAX_WORDS) break;
+            runWords = std::move(words);
+            ++j;
+        }
+        if (j - i < 2) {
+            resultp = AstNode::addNext(resultp, stmts[i]);
+            ++i;
+            continue;
+        }
+        FileLine* const flp = stmts[i]->fileline();
+        AstNodeExpr* anyp = nullptr;
+        for (const Word& word : runWords) {
+            AstNodeExpr* const wordp
+                = new AstArraySel{flp, new AstVarRef{flp, word.m_vscp, VAccess::READ},
+                                  static_cast<int>(word.m_index)};
+            anyp = anyp ? new AstOr{flp, anyp, wordp} : wordp;
+        }
+        AstNodeExpr* const condp = new AstNeq{
+            flp, anyp, new AstConst{flp, AstConst::WidthedValue{}, anyp->width(), 0}};
+        condp->dtypeSetBit();
+        AstIf* const ifp = new AstIf{flp, condp};
+        for (size_t k = i; k < j; ++k) ifp->addThensp(stmts[k]);
+        resultp = AstNode::addNext<AstNodeStmt, AstNodeStmt>(resultp, ifp);
+        i = j;
+    }
+    return resultp;
 }
 
 }  // namespace util

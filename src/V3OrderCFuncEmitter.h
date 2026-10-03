@@ -108,6 +108,9 @@ public:
         // Result is now spent, reset the emitter state
         m_result.clear();
         forceNewFunction();
+        if (stmtsp && v3Global.opt.schedDirtyTriggers()) {
+            stmtsp = V3Sched::util::addTriggerWordSkips(stmtsp);
+        }
         // Return the list of statement
         return stmtsp;
     }

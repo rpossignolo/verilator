@@ -484,6 +484,9 @@ AstNodeStmt* checkIterationLimit(AstNetlist* netlistp, const string& name, AstVa
 void splitCheck(AstCFunc* ofuncp);
 // Build an AstIf conditional on the given SenTree being triggered
 AstIf* createIfFromSenTree(AstSenTree* senTreep);
+// Wraps runs of trigger-guarded statements in a test of the trigger words they read, so a run
+// whose words are all clear is skipped at once
+AstNodeStmt* addTriggerWordSkips(AstNodeStmt* stmtsp);
 }  // namespace util
 
 void beforeTrigVisitor(AstNetlist* netlistp, SenExprBuilder& senExprBuilder,
