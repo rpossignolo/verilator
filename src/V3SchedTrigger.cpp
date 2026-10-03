@@ -1413,7 +1413,7 @@ void TriggerKit::addDirtyMarks(AstNetlist* netlistp) const {
         }
     }
 
-    // Whole-variable scalar writes mark only when the value changes: latches and combinational
+    // Packed writes mark only when the written value changes: latches and combinational
     // logic rewrite equal values every time they run, which would keep their groups always dirty
     std::map<const AstNodeDType*, AstVarScope*> oldTemps;
     AstScope* const topScopep = netlistp->topScopep()->scopep();
@@ -1445,9 +1445,9 @@ void TriggerKit::addDirtyMarks(AstNetlist* netlistp) const {
                 if (vrefp->varScopep() == refp->varScopep()) ++nRefs;
             });
             if (nRefs != 1) return;
-            const AstBasicDType* const basicp
-                = VN_CAST(assignp->lhsp()->dtypep()->skipRefp(), BasicDType);
-            if (!basicp || !basicp->isIntegralOrPacked() || basicp->width() > 64) return;
+            // Wide values too: a wide copy and compare is far cheaper than recomputing the groups
+            const AstNodeDType* const dtypep = assignp->lhsp()->dtypep()->skipRefp();
+            if (!dtypep->isIntegralOrPacked() || VN_IS(dtypep, UnpackArrayDType)) return;
             assignps.push_back(assignp);
         });
         for (AstNodeAssign* const assignp : assignps) {
