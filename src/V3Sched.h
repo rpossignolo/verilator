@@ -393,8 +393,15 @@ class TimingKit final {
     std::map<const AstVarScope*, std::set<AstSenTree*>> m_externalDomains;
 
 public:
+    // A variable whose writes in suspendable processes set a flag, instead of adding domains
+    struct WriteFlag final {
+        const AstVarScope* m_vscp;  // Variable written by suspendable processes
+        AstVarScope* m_flagVscp;  // Set after each such write, consumed by an extra trigger
+    };
+
     LogicByScope m_lbs;  // Actives that resume timing schedulers
     AstNodeStmt* m_postUpdates = nullptr;  // Post updates for the trigger eval function
+    std::vector<WriteFlag> m_writeFlags;  // --sched-timing-write-triggers variables
 
     // Remaps external domains using the specified trigger map
     std::map<const AstVarScope*, std::vector<AstSenTree*>> remapDomains(
@@ -408,10 +415,12 @@ public:
 
     TimingKit() = default;
     TimingKit(LogicByScope&& lbs, AstNodeStmt* postUpdates,
-              std::map<const AstVarScope*, std::set<AstSenTree*>>&& externalDomains)
+              std::map<const AstVarScope*, std::set<AstSenTree*>>&& externalDomains,
+              std::vector<WriteFlag>&& writeFlags)
         : m_externalDomains{externalDomains}
         , m_lbs{lbs}
-        , m_postUpdates{postUpdates} {}
+        , m_postUpdates{postUpdates}
+        , m_writeFlags{writeFlags} {}
     VL_UNCOPYABLE(TimingKit);
     TimingKit(TimingKit&&) = default;
     TimingKit& operator=(TimingKit&&) = default;

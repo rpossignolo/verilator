@@ -564,6 +564,7 @@ detailed descriptions of these arguments.
     --savable                   Enable model save-restore
     --sc                        Create SystemC output
     --sched-dirty-triggers      Recompute only triggers whose inputs changed
+    --sched-timing-write-triggers  Trigger readers of timing-process writes per write
     --sched-zero-delay          Specify #0 delay support
     --no-skip-identical         Disable skipping identical output
     --stats                     Create statistics file

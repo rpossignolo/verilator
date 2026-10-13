@@ -1030,6 +1030,11 @@ void schedule(AstNetlist* netlistp) {
         extraTriggers.allocate("virtual interface member: " + entry.m_ifacep->name() + "."
                                + entry.m_memberp->name());
     }
+    std::unordered_map<const AstVarScope*, uint32_t> writeFlagIndex;
+    for (const TimingKit::WriteFlag& flag : timingKit.m_writeFlags) {
+        const string desc = "timing write: " + flag.m_vscp->prettyName();
+        writeFlagIndex.emplace(flag.m_vscp, extraTriggers.allocate(desc));
+    }
 
     const auto& preTreeps = getSenTreesUsedBy({&logicRegions.m_pre});
     const auto& senTreeps = getSenTreesUsedBy({&logicRegions.m_act,  //
@@ -1049,6 +1054,19 @@ void schedule(AstNetlist* netlistp) {
     }
     addVirtIfaceTriggerAssignments(netlistp, staticp, virtIfaceTriggers, firstVifTriggerIndex,
                                    trigKit);
+    for (const TimingKit::WriteFlag& flag : timingKit.m_writeFlags) {
+        trigKit.addExtraTriggerAssignment(flag.m_flagVscp, writeFlagIndex.at(flag.m_vscp));
+    }
+    // One sentree per flagged variable and trigger vector, created on first use
+    std::map<std::pair<const AstVarScope*, const AstVarScope*>, AstSenTree*> writeFlagSens;
+    const auto addWriteFlagSens = [&](const AstVarScope* vscp, AstVarScope* trigVscp,
+                                      std::vector<AstSenTree*>& out) {
+        const auto it = writeFlagIndex.find(vscp);
+        if (it == writeFlagIndex.end()) return;
+        AstSenTree*& senTreep = writeFlagSens[{vscp, trigVscp}];
+        if (!senTreep) senTreep = trigKit.newExtraTriggerSenTree(trigVscp, it->second);
+        out.push_back(senTreep);
+    };
     if (v3Global.opt.stats()) V3Stats::statsStage("sched-create-triggers");
 
     // Note: Experiments so far show that running the Act (or Ico) regions on
@@ -1085,6 +1103,7 @@ void schedule(AstNetlist* netlistp) {
         "act", false, false, [&](const AstVarScope* vscp, std::vector<AstSenTree*>& out) {
             auto it = actTimingDomains.find(vscp);
             if (it != actTimingDomains.end()) out = it->second;
+            addWriteFlagSens(vscp, trigKit.vscp(), out);
             if (vscp->varp()->isWrittenByDpi()) out.push_back(dpiExportTriggeredAct);
             if (vscp->varp()->sensIfacep() || vscp->varp()->isVirtIface()) {
                 const auto& ifaceTriggered
@@ -1123,6 +1142,7 @@ void schedule(AstNetlist* netlistp) {
             [&](const AstVarScope* vscp, std::vector<AstSenTree*>& out) {
                 auto it = timingDomains.find(vscp);
                 if (it != timingDomains.end()) out = it->second;
+                addWriteFlagSens(vscp, trigVscp, out);
                 if (vscp->varp()->isWrittenByDpi()) out.push_back(dpiExportTriggered);
                 if (vscp->varp()->sensIfacep() || vscp->varp()->isVirtIface()) {
                     const auto& ifaceTriggered

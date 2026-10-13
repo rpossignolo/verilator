@@ -223,6 +223,12 @@ class AwaitVisitor final : public VNVisitor {
     AstUser1Allocator<AstCFunc, std::array<CFuncCache, 2>> m_cfuncsCache;
     // Count uses of not inlined writes to signals in suspendables
     VDouble0 m_notInlinedWritesInSuspendableUsage;
+    // Write references in suspendables per variable, in visit order
+    std::vector<AstVarScope*> m_writtenOrder;
+    std::unordered_map<AstVarScope*, std::vector<AstNodeVarRef*>> m_writeRefs;
+    std::unordered_set<const AstNodeVarRef*> m_seenWriteRefs;
+    VDouble0 m_statWriteFlags;  // Variables converted to write flags
+    VDouble0 m_statWriteFlagRejects;  // Variables kept on process domains
 
     // METHODS
     // Add arguments to a resume() call based on arguments in the suspending call
@@ -346,7 +352,13 @@ class AwaitVisitor final : public VNVisitor {
     }
     void visit(AstNodeVarRef* nodep) override {
         if (m_gatherVars && nodep->access().isWriteOrRW() && !nodep->varp()->ignoreSchedWrite()) {
-            m_writtenBySuspendable.insert(nodep->varScopep());
+            AstVarScope* const vscp = nodep->varScopep();
+            m_writtenBySuspendable.insert(vscp);
+            if (v3Global.opt.schedTimingWriteTriggers() && m_seenWriteRefs.insert(nodep).second) {
+                std::vector<AstNodeVarRef*>& refps = m_writeRefs[vscp];
+                if (refps.empty()) m_writtenOrder.push_back(vscp);
+                refps.push_back(nodep);
+            }
         }
     }
     void visit(AstNodeCCall* const nodep) override {
@@ -368,19 +380,70 @@ class AwaitVisitor final : public VNVisitor {
     //--------------------
     void visit(AstNode* nodep) override { iterateChildren(nodep); }
 
+    static AstNodeStmt* enclosingStmt(AstNode* nodep) {
+        while (nodep) {
+            if (AstNodeStmt* const stmtp = VN_CAST(nodep, NodeStmt)) return stmtp;
+            AstNode* backp = nodep->backp();
+            while (backp && backp->nextp() == nodep) {
+                nodep = backp;
+                backp = nodep->backp();
+            }
+            nodep = backp;
+        }
+        return nullptr;
+    }
+    // A flag set after a statement that suspends would hide writes made before the suspension
+    void createWriteFlags(std::vector<TimingKit::WriteFlag>& writeFlags) {
+        for (AstVarScope* const vscp : m_writtenOrder) {
+            // Temporaries are only read inside the writing process, so their domains cost nothing
+            if (vscp->varp()->isTemp() || vscp->varp()->isFuncLocal()) continue;
+            const auto domainIt = m_externalDomains.find(vscp);
+            if (domainIt == m_externalDomains.end()) continue;
+            std::vector<AstNodeStmt*> stmtps;
+            std::unordered_set<const AstNodeStmt*> seen;
+            bool ok = true;
+            for (AstNodeVarRef* const refp : m_writeRefs.at(vscp)) {
+                AstNodeStmt* const stmtp = enclosingStmt(refp);
+                if (!stmtp || stmtp->exists([](const AstCAwait*) { return true; })) {
+                    ok = false;
+                    break;
+                }
+                if (seen.insert(stmtp).second) stmtps.push_back(stmtp);
+            }
+            if (!ok) {
+                ++m_statWriteFlagRejects;
+                continue;
+            }
+            AstVarScope* const flagp = m_scopeTopp->createTemp(
+                "__VtimingWritten" + std::to_string(writeFlags.size()), 1);
+            for (AstNodeStmt* const stmtp : stmtps) {
+                FileLine* const flp = stmtp->fileline();
+                stmtp->addNextHere(new AstAssign{flp, new AstVarRef{flp, flagp, VAccess::WRITE},
+                                                 new AstConst{flp, AstConst::BitTrue{}}});
+            }
+            m_externalDomains.erase(domainIt);
+            writeFlags.push_back({vscp, flagp});
+            ++m_statWriteFlags;
+        }
+    }
+
 public:
     // CONSTRUCTORS
     explicit AwaitVisitor(AstNetlist* nodep, LogicByScope& lbs, AstNodeStmt*& postUpdatesr,
-                          std::map<const AstVarScope*, std::set<AstSenTree*>>& externalDomains)
+                          std::map<const AstVarScope*, std::set<AstSenTree*>>& externalDomains,
+                          std::vector<TimingKit::WriteFlag>& writeFlags)
         : m_scopeTopp{nodep->topScopep()->scopep()}
         , m_lbs{lbs}
         , m_postUpdatesr{postUpdatesr}
         , m_externalDomains{externalDomains} {
         iterate(nodep);
+        if (v3Global.opt.schedTimingWriteTriggers()) createWriteFlags(writeFlags);
     }
     ~AwaitVisitor() override {
         V3Stats::addStat("Scheduling, count of non-inlined signal writes in suspendables",
                          m_notInlinedWritesInSuspendableUsage);
+        V3Stats::addStat("Scheduling, timing write triggers", m_statWriteFlags);
+        V3Stats::addStat("Scheduling, timing write trigger rejects", m_statWriteFlagRejects);
     }
 };
 
@@ -389,8 +452,9 @@ TimingKit prepareTiming(AstNetlist* const netlistp) {
     LogicByScope lbs;
     AstNodeStmt* postUpdates = nullptr;
     std::map<const AstVarScope*, std::set<AstSenTree*>> externalDomains;
-    { AwaitVisitor{netlistp, lbs, postUpdates, externalDomains}; }
-    return {std::move(lbs), postUpdates, std::move(externalDomains)};
+    std::vector<TimingKit::WriteFlag> writeFlags;
+    { AwaitVisitor{netlistp, lbs, postUpdates, externalDomains, writeFlags}; }
+    return {std::move(lbs), postUpdates, std::move(externalDomains), std::move(writeFlags)};
 }
 
 //============================================================================

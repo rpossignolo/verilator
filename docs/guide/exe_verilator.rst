@@ -1733,6 +1733,17 @@ Summary:
    are still recomputed on every iteration. Ignored with :vlopt:`--threads`
    greater than 1.
 
+.. option:: --sched-timing-write-triggers
+
+   Make logic that reads a variable written by a process with timing
+   controls sensitive to an extra trigger set by each such write, instead
+   of to every event the writing process waits on. Without this option, a
+   variable written by a process containing a delay is treated as possibly
+   changed in every time step that resumes any delayed process, which can
+   re-evaluate large amounts of logic in time steps that change nothing.
+   Variables written in a statement that itself suspends keep the default
+   sensitivity.
+
 .. option:: --sched-zero-delay
 
 .. option:: --no-sched-zero-delay
