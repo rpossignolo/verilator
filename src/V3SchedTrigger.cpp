@@ -426,6 +426,24 @@ void TriggerKit::addExtraTriggerAssignment(AstVarScope* vscp, uint32_t index, bo
     m_compVecp->addStmtsp(setp);
 }
 
+AstNodeStmt* TriggerKit::newExtraTriggerFold(AstVarScope* flagVscp, uint32_t index,
+                                             const std::vector<AstVarScope*>& trigVscps) const {
+    index += m_nSenseWords * WORD_SIZE;
+    const uint32_t wordIndex = index / WORD_SIZE;
+    const uint32_t bitIndex = index % WORD_SIZE;
+    FileLine* const flp = flagVscp->fileline();
+    AstIf* const ifp = new AstIf{flp, new AstVarRef{flp, flagVscp, VAccess::READ}};
+    for (AstVarScope* const trigVscp : trigVscps) {
+        AstVarRef* const refp = new AstVarRef{flp, trigVscp, VAccess::WRITE};
+        AstNodeExpr* const wordp = new AstArraySel{flp, refp, static_cast<int>(wordIndex)};
+        ifp->addThensp(new AstAssign{flp, new AstSel{flp, wordp, static_cast<int>(bitIndex), 1},
+                                     new AstConst{flp, AstConst::BitTrue{}}});
+    }
+    ifp->addThensp(new AstAssign{flp, new AstVarRef{flp, flagVscp, VAccess::WRITE},
+                                 new AstConst{flp, AstConst::BitFalse{}}});
+    return ifp;
+}
+
 // Value-change detection for a single interface member VarScope written through a VIF.
 // Creates: trigger[bit] = (vscp != prev); prev = vscp;
 void TriggerKit::addValueChangeTriggerAssignment(AstNetlist* netlistp, AstCFunc* initFuncp,

@@ -378,6 +378,10 @@ public:
     // Set then extra trigger bit at 'index' to the value of 'vscp', then set 'vscp' to 0
     void addExtraTriggerAssignment(AstVarScope* vscp, uint32_t index, bool clear = true) const;
 
+    // If 'flagVscp' is set, set extra trigger bit 'index' in each of 'trigVscps' and clear it
+    AstNodeStmt* newExtraTriggerFold(AstVarScope* flagVscp, uint32_t index,
+                                     const std::vector<AstVarScope*>& trigVscps) const;
+
     // Set trigger bit at 'index' when vscp's value changes from previous evaluation.
     // Creates a prev variable: trigger[bit] = (vscp != prev); prev = vscp
     void addValueChangeTriggerAssignment(AstNetlist* netlistp, AstCFunc* initFuncp,
@@ -397,6 +401,7 @@ public:
     struct WriteFlag final {
         const AstVarScope* m_vscp;  // Variable written by suspendable processes
         AstVarScope* m_flagVscp;  // Set after each such write, consumed by an extra trigger
+        uint32_t m_index = 0;  // Extra trigger index in the 'act' trigger kit
     };
 
     LogicByScope m_lbs;  // Actives that resume timing schedulers

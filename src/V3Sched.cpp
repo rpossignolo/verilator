@@ -724,6 +724,12 @@ void createEval(AstNetlist* netlistp,  //
             }
             // Resume triggered timing schedulers
             if (timingResumep) workp = AstNode::addNext(workp, timingResumep->makeStmt());
+            // Readers of what resumed processes wrote run now, as with process domains
+            for (const TimingKit::WriteFlag& flag : timingKit.m_writeFlags) {
+                workp = AstNode::addNext(
+                    workp, trigKit.newExtraTriggerFold(flag.m_flagVscp, flag.m_index,
+                                                       {actKit.m_vscp, nbaKit.m_vscp}));
+            }
             // Invoke the 'act' function
             workp = AstNode::addNext(workp, util::callVoidFunc(actKit.m_funcp));
             //
@@ -1031,9 +1037,9 @@ void schedule(AstNetlist* netlistp) {
                                + entry.m_memberp->name());
     }
     std::unordered_map<const AstVarScope*, uint32_t> writeFlagIndex;
-    for (const TimingKit::WriteFlag& flag : timingKit.m_writeFlags) {
-        const string desc = "timing write: " + flag.m_vscp->prettyName();
-        writeFlagIndex.emplace(flag.m_vscp, extraTriggers.allocate(desc));
+    for (TimingKit::WriteFlag& flag : timingKit.m_writeFlags) {
+        flag.m_index = extraTriggers.allocate("timing write: " + flag.m_vscp->prettyName());
+        writeFlagIndex.emplace(flag.m_vscp, flag.m_index);
     }
 
     const auto& preTreeps = getSenTreesUsedBy({&logicRegions.m_pre});
@@ -1055,7 +1061,7 @@ void schedule(AstNetlist* netlistp) {
     addVirtIfaceTriggerAssignments(netlistp, staticp, virtIfaceTriggers, firstVifTriggerIndex,
                                    trigKit);
     for (const TimingKit::WriteFlag& flag : timingKit.m_writeFlags) {
-        trigKit.addExtraTriggerAssignment(flag.m_flagVscp, writeFlagIndex.at(flag.m_vscp));
+        trigKit.addExtraTriggerAssignment(flag.m_flagVscp, flag.m_index);
     }
     // One sentree per flagged variable and trigger vector, created on first use
     std::map<std::pair<const AstVarScope*, const AstVarScope*>, AstSenTree*> writeFlagSens;
