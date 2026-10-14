@@ -95,8 +95,11 @@ struct VlWide final {
         return std::memcmp(m_storage, that.m_storage, N_Words * sizeof(EData)) == 0;
     }
     bool operator!=(const VlWide<N_Words>& that) const VL_PURE { return !(*this == that); }
-    EData& operator[](size_t index) VL_MT_SAFE { return m_storage[index]; }
-    const EData& operator[](size_t index) const VL_MT_SAFE { return m_storage[index]; }
+    // Always inlined, also into the -O0 translation units that hold oversized functions
+    VL_ATTR_ALWINLINE EData& operator[](size_t index) VL_MT_SAFE { return m_storage[index]; }
+    VL_ATTR_ALWINLINE const EData& operator[](size_t index) const VL_MT_SAFE {
+        return m_storage[index];
+    }
     VlWide<N_Words>& operator&=(const VlWide& rhs) {
         VL_AND_W(N_Words, *this, *this, rhs);
         return *this;
@@ -1488,8 +1491,10 @@ public:
         return find_element<N_CurrentDimension>(indices, std::is_class<T_Value>{});
     }
 
-    T_Value& operator[](size_t index) { return m_storage[index]; }
-    constexpr const T_Value& operator[](size_t index) const { return m_storage[index]; }
+    VL_ATTR_ALWINLINE T_Value& operator[](size_t index) { return m_storage[index]; }
+    VL_ATTR_ALWINLINE constexpr const T_Value& operator[](size_t index) const {
+        return m_storage[index];
+    }
 
     // *this != that, which might be used for change detection/trigger computation, but avoid
     // operator overloading in VlUnpacked for safety in other contexts.
@@ -1853,6 +1858,36 @@ template <typename T_Target,  // Type of the variable this commit queue updates
           >
 class VlNBACommitQueue;
 
+// Append-only buffer for pending NBA updates. Appends are inlined at every enqueue site; growth
+// is out of line, as std::vector::emplace_back is not inlined at -O1 and dominated large models.
+template <typename T_Entry>
+class VlNBAPendingBuffer final {
+    std::unique_ptr<T_Entry[]> m_bufp;  // Storage, valid up to m_capacity
+    size_t m_size = 0;  // Entries in use
+    size_t m_capacity = 0;  // Entries allocated
+
+    VL_ATTR_NOINLINE void grow() {
+        const size_t capacity = m_capacity ? 2 * m_capacity : 16;
+        std::unique_ptr<T_Entry[]> bufp{new T_Entry[capacity]};
+        std::copy(m_bufp.get(), m_bufp.get() + m_size, bufp.get());
+        m_bufp = std::move(bufp);
+        m_capacity = capacity;
+    }
+
+public:
+    VlNBAPendingBuffer() = default;
+    VL_UNCOPYABLE(VlNBAPendingBuffer);
+
+    VL_ATTR_ALWINLINE void push(const T_Entry& entry) {
+        if (VL_UNLIKELY(m_size == m_capacity)) grow();
+        m_bufp[m_size++] = entry;
+    }
+    bool empty() const { return m_size == 0; }
+    void clear() { m_size = 0; }
+    const T_Entry* begin() const { return m_bufp.get(); }
+    const T_Entry* end() const { return m_bufp.get() + m_size; }
+};
+
 // Specialization for whole element updates only
 template <typename T_Target, typename T_Element, std::size_t N_Rank>
 class VlNBACommitQueue<T_Target, /* Partial: */ false, T_Element, N_Rank> final {
@@ -1863,7 +1898,7 @@ class VlNBACommitQueue<T_Target, /* Partial: */ false, T_Element, N_Rank> final 
     };
 
     // STATE
-    std::vector<Entry> m_pending;  // Pending updates, in program order
+    VlNBAPendingBuffer<Entry> m_pending;  // Pending updates, in program order
 
 public:
     // CONSTRUCTOR
@@ -1872,8 +1907,8 @@ public:
 
     // METHODS
     template <typename... T_Args>
-    void enqueue(const T_Element& value, T_Args... indices) {
-        m_pending.emplace_back(Entry{value, {indices...}});
+    VL_ATTR_ALWINLINE void enqueue(const T_Element& value, T_Args... indices) {
+        m_pending.push(Entry{value, {indices...}});
     }
 
     // Note: T_Commit might be different from T_Target. Specifically, when the signal is a
@@ -1899,7 +1934,7 @@ class VlNBACommitQueue<T_Target, /* Partial: */ true, T_Element, N_Rank> final {
     };
 
     // STATE
-    std::vector<Entry> m_pending;  // Pending updates, in program order
+    VlNBAPendingBuffer<Entry> m_pending;  // Pending updates, in program order
 
     // STATIC METHODS
 
@@ -1957,8 +1992,9 @@ public:
 
     // METHODS
     template <typename... T_Args>
-    void enqueue(const T_Element& value, const T_Element& mask, T_Args... indices) {
-        m_pending.emplace_back(Entry{value, mask, {indices...}});
+    VL_ATTR_ALWINLINE void enqueue(const T_Element& value, const T_Element& mask,
+                                   T_Args... indices) {
+        m_pending.push(Entry{value, mask, {indices...}});
     }
 
     // Note: T_Commit might be different from T_Target. Specifically, when the signal is a

@@ -1410,7 +1410,9 @@ inline void _vl_insert_QQ(QData& lhsr, QData ld, int hbit, int lbit, int rbits) 
     const QData insmask = (VL_MASK_Q(hbit - lbit + 1)) << lbit;
     lhsr = (lhsr & ~insmask) | ((ld << lbit) & (insmask & cleanmask));
 }
-inline void _vl_insert_WI(WDataOutP iowp, IData ld, int hbit, int lbit, int rbits = 0) VL_MT_SAFE {
+// Always inlined: bit positions are usually constants, so the inlined body folds to a few ops
+VL_ATTR_ALWINLINE void _vl_insert_WI(WDataOutP iowp, IData ld, int hbit, int lbit,
+                                     int rbits = 0) VL_MT_SAFE {
     // Insert value ld into iowp at bit slice [hbit:lbit]. iowp is rbits wide.
     const int hoffset = VL_BITBIT_E(hbit);
     const int loffset = VL_BITBIT_E(lbit);
