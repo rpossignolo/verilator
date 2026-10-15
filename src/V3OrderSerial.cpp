@@ -66,5 +66,5 @@ AstNodeStmt* V3Order::createSerial(OrderMoveGraph& moveGraph, const std::string&
         }
     }
 
-    return emitter.getStmts();
+    return emitter.getStmts(/* summarize: */ true);
 }

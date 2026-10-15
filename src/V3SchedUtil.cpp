@@ -261,10 +261,14 @@ AstIf* createIfFromSenTree(AstSenTree* senTreep) {
     return new AstIf{senTreep->fileline(), senEqnp};
 }
 
-AstNodeStmt* addTriggerWordSkips(AstNodeStmt* stmtsp) {
+AstNodeStmt* addTriggerWordSkips(AstNodeStmt* stmtsp, bool summarize) {
     // A run is wrapped while its words stay few, so the outer test stays cheaper than the guards
     constexpr size_t MAX_WORDS = 16;
     constexpr size_t MAX_STMTS = 64;
+    // With summaries, a test costs one term per summary word instead of one per trigger word
+    constexpr size_t MAX_SUMMARY_WORDS = 8;
+    constexpr size_t MIN_GUARD_WORDS = 4;
+    constexpr uint32_t SUMMARY_BITS = 64;
     struct Word final {
         AstVarScope* m_vscp;
         uint32_t m_index;
@@ -299,44 +303,142 @@ AstNodeStmt* addTriggerWordSkips(AstNodeStmt* stmtsp) {
         });
         return pure && any;
     };
+    const auto summaryWords = [&](const std::vector<Word>& words) {
+        std::vector<Word> sums;
+        for (const Word& word : words) {
+            const Word sum{word.m_vscp, word.m_index / SUMMARY_BITS};
+            if (std::find(sums.begin(), sums.end(), sum) == sums.end()) sums.push_back(sum);
+        }
+        return sums;
+    };
+    // Summary of each trigger vector: bit w%64 of word w/64 is set iff trigger word w is nonzero
+    std::vector<std::pair<AstVarScope*, AstVarScope*>> summaries;
+    const auto summaryOf = [&](AstVarScope* vecp) {
+        for (const auto& pair : summaries) {
+            if (pair.first == vecp) return pair.second;
+        }
+        AstNetlist* const netlistp = v3Global.rootp();
+        AstScope* const scopep = netlistp->topScopep()->scopep();
+        FileLine* const flp = scopep->fileline();
+        const AstUnpackArrayDType* const vecDTypep = VN_AS(vecp->dtypep(), UnpackArrayDType);
+        const uint32_t nWords = vecDTypep->elementsConst();
+        const uint32_t nSums = (nWords + SUMMARY_BITS - 1) / SUMMARY_BITS;
+        AstNodeDType* const wordDTypep
+            = netlistp->findBitDType(SUMMARY_BITS, SUMMARY_BITS, VSigning::UNSIGNED);
+        AstUnpackArrayDType* const dtypep = new AstUnpackArrayDType{
+            flp, wordDTypep, new AstRange{flp, static_cast<int>(nSums - 1), 0}};
+        netlistp->typeTablep()->addTypesp(dtypep);
+        AstVarScope* const sump = scopep->createTemp(vecp->varp()->name() + "Summary", dtypep);
+        summaries.emplace_back(vecp, sump);
+        return sump;
+    };
+    // True iff any of the given trigger words is nonzero
+    const auto newSummaryTest = [&](FileLine* flp, const std::vector<Word>& words) {
+        AstNodeExpr* anyp = nullptr;
+        for (const Word& sum : summaryWords(words)) {
+            V3Number mask{flp, static_cast<int>(SUMMARY_BITS), 0};
+            for (const Word& word : words) {
+                if (word.m_vscp == sum.m_vscp && word.m_index / SUMMARY_BITS == sum.m_index) {
+                    mask.setBit(word.m_index % SUMMARY_BITS, '1');
+                }
+            }
+            AstNodeExpr* const selp = new AstArraySel{
+                flp, new AstVarRef{flp, summaryOf(sum.m_vscp), VAccess::READ},
+                static_cast<int>(sum.m_index)};
+            AstNodeExpr* const termp = new AstAnd{flp, new AstConst{flp, mask}, selp};
+            anyp = anyp ? new AstOr{flp, anyp, termp} : termp;
+        }
+        AstNodeExpr* const condp = new AstNeq{
+            flp, anyp, new AstConst{flp, AstConst::WidthedValue{}, anyp->width(), 0}};
+        condp->dtypeSetBit();
+        return condp;
+    };
     std::vector<AstNodeStmt*> stmts;
+    std::vector<std::vector<Word>> stmtWords;
+    std::vector<bool> isGuard;
     for (AstNodeStmt *nodep = stmtsp, *nextp; nodep; nodep = nextp) {
         nextp = VN_AS(nodep->nextp(), NodeStmt);
         if (nextp) nextp->unlinkFrBackWithNext();
         stmts.push_back(nodep);
+        stmtWords.emplace_back();
+        isGuard.push_back(addWords(nodep, stmtWords.back()));
     }
+    // Pre-test wide guards on the summary; done after grouping, as it makes conditions impure
+    const auto addGuardPreTest = [&](size_t k) {
+        if (!summarize || !isGuard[k] || stmtWords[k].size() < MIN_GUARD_WORDS) return;
+        AstIf* const ifp = VN_AS(stmts[k], If);
+        FileLine* const flp = ifp->fileline();
+        AstNodeExpr* const origp = ifp->condp()->unlinkFrBack();
+        AstNodeExpr* const testp = newSummaryTest(flp, stmtWords[k]);
+        AstNodeExpr* const andp = new AstLogAnd{flp, testp, origp};
+        andp->dtypeSetBit();
+        ifp->condp(andp);
+    };
     AstNodeStmt* resultp = nullptr;
     size_t i = 0;
     while (i < stmts.size()) {
         std::vector<Word> runWords;
         size_t j = i;
-        while (j < stmts.size() && j - i < MAX_STMTS) {
+        while (j < stmts.size() && j - i < MAX_STMTS && isGuard[j]) {
             std::vector<Word> words = runWords;
-            if (!addWords(stmts[j], words) || words.size() > MAX_WORDS) break;
+            for (const Word& word : stmtWords[j]) {
+                if (std::find(words.begin(), words.end(), word) == words.end()) {
+                    words.push_back(word);
+                }
+            }
+            const bool fits = summarize ? summaryWords(words).size() <= MAX_SUMMARY_WORDS
+                                        : words.size() <= MAX_WORDS;
+            if (!fits) break;
             runWords = std::move(words);
             ++j;
         }
         if (j - i < 2) {
+            addGuardPreTest(i);
             resultp = AstNode::addNext(resultp, stmts[i]);
             ++i;
             continue;
         }
         FileLine* const flp = stmts[i]->fileline();
-        AstNodeExpr* anyp = nullptr;
-        for (const Word& word : runWords) {
-            AstNodeExpr* const wordp
-                = new AstArraySel{flp, new AstVarRef{flp, word.m_vscp, VAccess::READ},
-                                  static_cast<int>(word.m_index)};
-            anyp = anyp ? new AstOr{flp, anyp, wordp} : wordp;
+        AstNodeExpr* condp = nullptr;
+        if (summarize) {
+            condp = newSummaryTest(flp, runWords);
+        } else {
+            AstNodeExpr* anyp = nullptr;
+            for (const Word& word : runWords) {
+                AstNodeExpr* const wordp
+                    = new AstArraySel{flp, new AstVarRef{flp, word.m_vscp, VAccess::READ},
+                                      static_cast<int>(word.m_index)};
+                anyp = anyp ? new AstOr{flp, anyp, wordp} : wordp;
+            }
+            condp = new AstNeq{flp, anyp,
+                               new AstConst{flp, AstConst::WidthedValue{}, anyp->width(), 0}};
+            condp->dtypeSetBit();
         }
-        AstNodeExpr* const condp = new AstNeq{
-            flp, anyp, new AstConst{flp, AstConst::WidthedValue{}, anyp->width(), 0}};
-        condp->dtypeSetBit();
         AstIf* const ifp = new AstIf{flp, condp};
-        for (size_t k = i; k < j; ++k) ifp->addThensp(stmts[k]);
+        for (size_t k = i; k < j; ++k) {
+            addGuardPreTest(k);
+            ifp->addThensp(stmts[k]);
+        }
         resultp = AstNode::addNext<AstNodeStmt, AstNodeStmt>(resultp, ifp);
         i = j;
     }
+    // Fill the summaries before any test reads them
+    AstNodeStmt* headp = nullptr;
+    for (const auto& pair : summaries) {
+        FileLine* const flp = pair.first->fileline();
+        const uint32_t nWords = VN_AS(pair.first->dtypep(), UnpackArrayDType)->elementsConst();
+        const uint32_t nSums = VN_AS(pair.second->dtypep(), UnpackArrayDType)->elementsConst();
+        AstCStmt* const cstmtp = new AstCStmt{flp};
+        cstmtp->add("for (size_t i = 0; i < " + std::to_string(nSums) + "; ++i) ");
+        cstmtp->add(new AstVarRef{flp, pair.second, VAccess::WRITE});
+        cstmtp->add("[i] = 0;\nfor (size_t w = 0; w < " + std::to_string(nWords) + "; ++w) ");
+        cstmtp->add(new AstVarRef{flp, pair.second, VAccess::WRITE});
+        cstmtp->add("[w >> 6] |= static_cast<QData>(");
+        cstmtp->add(new AstVarRef{flp, pair.first, VAccess::READ});
+        cstmtp->add("[w] != 0) << (w & 63);");
+        headp = AstNode::addNext<AstNodeStmt, AstNodeStmt>(headp, cstmtp);
+    }
+    if (headp) resultp = AstNode::addNext<AstNodeStmt, AstNodeStmt>(headp, resultp);
     return resultp;
 }
 

@@ -83,7 +83,8 @@ public:
     }
 
     // Retrieve list of statements which when executed will call the constructed functions
-    AstNodeStmt* getStmts() {
+    // 'summarize': trigger tests may use per-function summaries (single-threaded callers only)
+    AstNodeStmt* getStmts(bool summarize = false) {
         // The resulting list of statements we are constructing here
         AstNodeStmt* stmtsp = nullptr;
         // Current AstIf
@@ -109,7 +110,7 @@ public:
         m_result.clear();
         forceNewFunction();
         if (stmtsp && v3Global.opt.schedDirtyTriggers()) {
-            stmtsp = V3Sched::util::addTriggerWordSkips(stmtsp);
+            stmtsp = V3Sched::util::addTriggerWordSkips(stmtsp, summarize);
         }
         // Return the list of statement
         return stmtsp;

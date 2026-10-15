@@ -499,8 +499,9 @@ void splitCheck(AstCFunc* ofuncp);
 // Build an AstIf conditional on the given SenTree being triggered
 AstIf* createIfFromSenTree(AstSenTree* senTreep);
 // Wraps runs of trigger-guarded statements in a test of the trigger words they read, so a run
-// whose words are all clear is skipped at once
-AstNodeStmt* addTriggerWordSkips(AstNodeStmt* stmtsp);
+// whose words are all clear is skipped at once. With 'summarize', tests read a per-function
+// summary of nonzero trigger words, filled at the head of the returned list.
+AstNodeStmt* addTriggerWordSkips(AstNodeStmt* stmtsp, bool summarize);
 }  // namespace util
 
 void beforeTrigVisitor(AstNetlist* netlistp, SenExprBuilder& senExprBuilder,
